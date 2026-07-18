@@ -44,10 +44,11 @@ Q_RATIO_BOUNDS = (0.0, 1.0)     # 뼈대는 (0.0, 0.0)로 고정해 사용 (Q=0)
 TIME_STEPS = 24
 DT_HOURS = 1.0
 
-SOC_MIN = 0.05
-SOC_MAX = 0.95
-SOC_INIT = 0.50              # SOC[0] = SOC[24] = 50% 고정 (최대엔트로피 선택)
-DOD = 0.90                   # = SOC_MAX - SOC_MIN
+SOC_MIN_FRAC = 0.05
+SOC_MAX_FRAC = 0.95
+SOC_INIT_FRAC = 0.50         # SOC[0] = SOC[24] = 50% 고정 (최대엔트로피 선택)
+DOD = 0.90                   # = SOC_MAX_FRAC - SOC_MIN_FRAC
+# SOC 규약: MWh(에너지 절대량), 위 _FRAC 상수는 비율. LP 내부에서 E_rated를 곱해 사용 (부록A #1)
 
 ETA_C = 0.9487                # 충전효율 (RTE 0.90 = ETA_C * ETA_D)
 ETA_D = 0.9487                # 방전효율

@@ -16,21 +16,24 @@ import cvxpy as cp
 import params as PM
 
 
-def _empty_result(T, soc_init):
-    return np.zeros(T), np.full(T + 1, soc_init)
+def _empty_result(T, soc_init_frac, E_mwh):
+    return np.zeros(T), np.full(T + 1, soc_init_frac * E_mwh)
 
 
-def _soc_constraints(P_ch, P_dis, soc, T, E_mwh, eta_c, eta_d, dt, self_discharge, soc_init, soc_min, soc_max):
+def _soc_constraints(P_ch, P_dis, soc, T, E_mwh, eta_c, eta_d, dt, self_discharge,
+                      soc_init_frac, soc_min_frac, soc_max_frac):
+    """soc(cvxpy 변수)는 MWh 절대량 규약 (CLAUDE.md 2절 SOC 제약, 부록A #1).
+    soc_init_frac/soc_min_frac/soc_max_frac은 비율(0~1)로 받아 여기서 E_mwh를 곱해 변환."""
     cons = [
-        soc[0] == soc_init,
-        soc[T] == soc_init,
-        soc >= soc_min,
-        soc <= soc_max,
+        soc[0] == soc_init_frac * E_mwh,
+        soc[T] == soc_init_frac * E_mwh,
+        soc >= soc_min_frac * E_mwh,
+        soc <= soc_max_frac * E_mwh,
     ]
     for t in range(T):
         cons.append(
             soc[t + 1] == soc[t] * (1 - self_discharge)
-            + (eta_c * P_ch[t] * dt - P_dis[t] / eta_d * dt) / E_mwh
+            + eta_c * P_ch[t] * dt - P_dis[t] / eta_d * dt
         )
     return cons
 
@@ -41,13 +44,16 @@ def _check_solved(prob, name):
 
 
 def _assert_physics(p_ch, p_dis, soc, S_mw, E_mwh, eta_c, eta_d, dt, self_discharge,
-                     soc_init, soc_min, soc_max, tol=1e-4):
+                     soc_init_frac, soc_min_frac, soc_max_frac, tol=1e-4):
     """물리 보존 assert (CLAUDE.md 7절 LP검증#2). 개발 중 기본 켜짐(assert_physics=True),
     본실험 시 호출부에서 assert_physics=False로 꺼서 속도 확보."""
     T = len(p_ch)
-    assert np.isclose(soc[0], soc_init, atol=tol)
-    assert np.isclose(soc[T], soc_init, atol=tol)
-    assert np.all(soc >= soc_min - tol) and np.all(soc <= soc_max + tol)
+    soc_init_mwh = soc_init_frac * E_mwh
+    soc_min_mwh = soc_min_frac * E_mwh
+    soc_max_mwh = soc_max_frac * E_mwh
+    assert np.isclose(soc[0], soc_init_mwh, atol=tol)
+    assert np.isclose(soc[T], soc_init_mwh, atol=tol)
+    assert np.all(soc >= soc_min_mwh - tol) and np.all(soc <= soc_max_mwh + tol)
     assert np.all(p_ch <= S_mw + tol) and np.all(p_dis <= S_mw + tol)
     assert np.all(p_ch >= -tol) and np.all(p_dis >= -tol)
 
@@ -58,7 +64,7 @@ def _assert_physics(p_ch, p_dis, soc, S_mw, E_mwh, eta_c, eta_d, dt, self_discha
     for t in range(T):
         soc_recheck[t + 1] = soc_recheck[t] * (1 - self_discharge) + (
             eta_c * p_ch[t] * dt - p_dis[t] / eta_d * dt
-        ) / E_mwh
+        )
     assert np.allclose(soc_recheck, soc, atol=tol), '에너지수지(SOC 재귀식) 불일치'
 
 
@@ -66,22 +72,23 @@ def solve_avg(
     S_mw, E_mwh, smp,
     *, eta_c=PM.ETA_C, eta_d=PM.ETA_D, dt=PM.DT_HOURS, T=PM.TIME_STEPS,
     self_discharge=PM.SELF_DISCHARGE_HOURLY,
-    soc_init=PM.SOC_INIT, soc_min=PM.SOC_MIN, soc_max=PM.SOC_MAX,
+    soc_init=PM.SOC_INIT_FRAC, soc_min=PM.SOC_MIN_FRAC, soc_max=PM.SOC_MAX_FRAC,
     assert_physics=True,
 ):
     """AVG_DAYS: 조달비(슬랙 유입 대리) 최소화.
-    min Σ_t SMP[t]*(P_ch[t]-P_dis[t])*dt  (CLAUDE.md 2절)
+    min Σ_t SMP[t]*(P_ch[t]-P_dis[t])*dt + 1e-6*Σ_t(P_ch[t]+P_dis[t])  (CLAUDE.md 2절)
 
     smp: 길이 T 배열 (원/kWh, 절대값, 정규화 안 함).
+    soc_init/soc_min/soc_max: 비율(0~1). 함수 내부에서 E_mwh를 곱해 절대량(MWh)으로 사용.
     반환: (P_net, soc)
       P_net: 길이 T (MW, +방전/-충전)
-      soc:   길이 T+1 (SOC[0]=SOC[T]=soc_init, 소수 0~1)
+      soc:   길이 T+1 (SOC[0]=SOC[T]=soc_init*E_mwh, 단위 MWh - 부록A #1 규약)
     """
     smp = np.asarray(smp, dtype=float)
     assert smp.shape == (T,), f'smp shape {smp.shape} != ({T},)'
 
     if S_mw <= 0 or E_mwh <= 0:
-        return _empty_result(T, soc_init)
+        return _empty_result(T, soc_init, E_mwh)
 
     P_ch = cp.Variable(T, nonneg=True)
     P_dis = cp.Variable(T, nonneg=True)
@@ -92,7 +99,12 @@ def solve_avg(
         P_ch, P_dis, soc, T, E_mwh, eta_c, eta_d, dt, self_discharge, soc_init, soc_min, soc_max
     )
 
-    objective = cp.Minimize(cp.sum(cp.multiply(smp, P_ch - P_dis)) * dt)
+    # 1e-6*(P_ch+P_dis) 정규화항: SMP 평탄·eta=1처럼 주 목적함수가 degenerate해질 때
+    # (동시충방전을 포함한 여러 해가 같은 목적값을 갖는 상황) 동시충방전 해를 배제.
+    # 주 목적함수 대비 6자리 작아 정상적인(스프레드 있는) 차익거래 최적해는 왜곡하지 않음.
+    objective = cp.Minimize(
+        cp.sum(cp.multiply(smp, P_ch - P_dis)) * dt + 1e-6 * cp.sum(P_ch + P_dis)
+    )
     prob = cp.Problem(objective, constraints)
     prob.solve()
     _check_solved(prob, 'solve_avg')
@@ -109,23 +121,30 @@ def solve_peak(
     S_mw, E_mwh, load_mw,
     *, eta_c=PM.ETA_C, eta_d=PM.ETA_D, dt=PM.DT_HOURS, T=PM.TIME_STEPS,
     self_discharge=PM.SELF_DISCHARGE_HOURLY,
-    soc_init=PM.SOC_INIT, soc_min=PM.SOC_MIN, soc_max=PM.SOC_MAX,
+    soc_init=PM.SOC_INIT_FRAC, soc_min=PM.SOC_MIN_FRAC, soc_max=PM.SOC_MAX_FRAC,
     assert_physics=True,
 ):
     """PEAK_DAYS: 자기 피크 pk_s = max_t(load[t]-P_net[t]) 최소화. (CLAUDE.md 2절)
     최종 이연 산정은 사후에 max(pk_summer, pk_winter) (호출부 책임, 여기선 단일 시나리오만).
 
+    ★ 주의: 반환하는 pk_s는 손실을 무시한 "부하단" 대리값 max_t(load[t]-P_net[t])이며,
+    B_defer 산정에 직접 쓰지 말 것. 3절 B_defer는 "슬랙 유입 피크" max_t(P_slack)이고
+    P_slack = Σ부하 + Loss - P_ESS라 pk_s와는 손실만큼 다르다. B_defer는 반드시 이 함수가
+    반환한 스케줄(P_net)을 사후 조류계산에 넣어 얻은 슬랙 피크로 계산해야 한다
+    (CLAUDE.md 2절 "★ 주의", 3절 B_defer). pk_s는 스케줄을 정하기 위한 내부 대리값일 뿐이다.
+
     load_mw: 길이 T 배열, 해당 시나리오 시간별 피더 총부하(MW, 유효전력).
+    soc_init/soc_min/soc_max: 비율(0~1). 함수 내부에서 E_mwh를 곱해 절대량(MWh)으로 사용.
     반환: (P_net, soc, pk_s)
       P_net: 길이 T (MW, +방전/-충전)
-      soc:   길이 T+1
-      pk_s:  스칼라 (MW), 이 시나리오의 ESS 적용 후 피크.
+      soc:   길이 T+1 (단위 MWh - 부록A #1 규약)
+      pk_s:  스칼라 (MW), 이 시나리오의 "부하단" 대리 피크 (위 경고 참조).
     """
     load_mw = np.asarray(load_mw, dtype=float)
     assert load_mw.shape == (T,), f'load_mw shape {load_mw.shape} != ({T},)'
 
     if S_mw <= 0 or E_mwh <= 0:
-        P_net, soc_val = _empty_result(T, soc_init)
+        P_net, soc_val = _empty_result(T, soc_init, E_mwh)
         return P_net, soc_val, float(load_mw.max())
 
     P_ch = cp.Variable(T, nonneg=True)
