@@ -2,6 +2,8 @@
 # 파라미터 수정은 이 파일만 건드리면 되도록 유지 (CLAUDE.md 부록A 분리 원칙).
 # 값이 바뀌더라도 사용처 파일에서 재정의/override 하지 말고 이 파일을 고칠 것.
 
+import numpy as np
+
 # ============================================================
 # 1. 계통 (CLAUDE.md 1절)
 # ============================================================
@@ -108,6 +110,18 @@ ALL_DAYS = AVG_DAYS + PEAK_DAYS
 
 N_WEEKDAYS = {'summer': 63.6, 'winter': 60.8, 'shoulder': 122.6}   # 가중치 계산 전용, 정확값(반올림 안 함)
 TOTAL_WEEKDAYS_PER_YEAR = sum(N_WEEKDAYS.values())   # = 247.0
+
+# ============================================================
+# 5-1. MW/MWh/원 단위 변환 상수 (benefits.py 전용)
+# ============================================================
+# benefits.py는 처음부터 끝까지 MW/MWh/원 단일 단위로 계산한다(함수 내부에 ×1000 없음).
+# 아래 상수는 전부 위에서 이미 정의된 kW/kVA/kWh 기준 상수에 1000을 곱해서만 정의한다
+# (숫자를 다시 타이핑하지 않음 - 오타 시 두 값이 갈리는 것을 원천 차단).
+C_CAP_PER_MW_YR = C_CAP * 1000                # 원/MW-yr (기존 C_CAP: 원/kW-yr)
+C_KWH_CAPEX_PER_MWH = C_KWH_CAPEX * 1000      # 원/MWh (기존 C_KWH_CAPEX: 원/kWh)
+C_KW_CAPEX_PER_MVA = C_KW_CAPEX * 1000        # 원/MVA (기존 C_KW_CAPEX: 원/kVA)
+C_KWH_OPEX_PER_MWH_YR = C_KWH_OPEX * 1000     # 원/MWh-yr (기존 C_KWH_OPEX: 원/kWh-yr)
+SMP_PER_MWH = {s: np.array(v) * 1000.0 for s, v in SMP.items()}   # 원/MWh (기존 SMP: 원/kWh)
 
 # ============================================================
 # 6. 손익분기 부등식 참고값 (CLAUDE.md 6절 - 해석/경계설정 근거, 연산 미사용)
