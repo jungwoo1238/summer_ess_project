@@ -5,8 +5,9 @@
 제외할 수 있게 한다.
 
 test_lp/test_benefits처럼 손계산 대조가 불가능하므로(조류계산은 손으로 못 품) 대신
-불변량·극한을 검증한다(CLAUDE.md 7절 원칙 3): S=0/E=0 극한, 기저 재현, 실데이터 수지,
-편익 분해 검산, 발산 처리, fitness 유한성, 다수기 구조.
+불변량·극한을 검증한다(CLAUDE.md 7절 원칙 3): S=0/E=0 극한, 기저 재현, 전압위반 유무
+(현행 슬랙 1.02 / 구 슬랙 1.0 회귀), 실데이터 수지, 편익 분해 검산, 발산 처리,
+fitness 유한성, 다수기 구조.
 
 pytest 없이도 단독 실행 가능: `python test_evaluate.py`
 """
@@ -31,12 +32,17 @@ pytestmark = pytest.mark.slow
 def test_base_reproduces_validation():
     """summer_peak, t=18의 배율이 정확히 1.0 -> case33bw 기본부하 상태와 동일해야 한다
     (5절 "부하 정규화 1.0 = 여름최대일 t=18 = case33bw 기본부하"). build_net을 독립적으로
-    돌려 0번 검증값을 재현하는지 먼저 확인하고, evaluate.init_worker()가 캐싱한
-    _BASE_FLOW의 같은 지점(p_slack, loss)이 정확히 일치하는지 대조한다."""
+    돌려(슬랙 전압은 인자 생략 -> PM.SLACK_VM_PU 현행 기본값 1.02) 검증값을 재현하는지
+    먼저 확인하고, evaluate.init_worker()가 캐싱한 _BASE_FLOW의 같은 지점(p_slack, loss)이
+    정확히 일치하는지 대조한다.
+
+    ★ slack_import_mw_scaled는 PM.VALIDATION에 없다(현행 기준 - CLAUDE.md 1절: 슬랙 유입은
+    부하 프로파일·슬랙 전압에 둘 다 의존해 단일 검증값으로 부적절하다고 명시적으로 제외됨).
+    구 슬랙(1.0) 기준값에는 남아 있다 - PM.VALIDATION_LEGACY_SLACK_1P0 참조."""
     scale = PM.LOAD['summer_peak'][18]
     assert np.isclose(scale, 1.0), scale
 
-    net = build_net()
+    net = build_net()  # slack_vm_pu 생략 -> PM.SLACK_VM_PU(현행 1.02)
     base_p = net.load['p_mw'].to_numpy().copy()
     base_q = net.load['q_mvar'].to_numpy().copy()
     net.load['p_mw'] = base_p * scale
@@ -47,19 +53,17 @@ def test_base_reproduces_validation():
     vmin = net.res_bus.vm_pu.min()
     vmin_bus = net.res_bus.vm_pu.idxmin()
     line0_a = net.res_line.at[0, 'i_ka'] * 1000
-    slack_mw = net.res_ext_grid.p_mw.sum()
+    slack_mw = net.res_ext_grid.p_mw.sum()  # 참고용 출력만, 검증 비교 대상 아님(위 설명 참조)
 
     assert np.isclose(loss_kw, PM.VALIDATION['loss_kw_scaled'], atol=0.05), loss_kw
     assert np.isclose(vmin, PM.VALIDATION['vmin_pu_scaled'], atol=1e-3), vmin
     assert vmin_bus == PM.VALIDATION['vmin_bus'], vmin_bus
     assert np.isclose(line0_a, PM.VALIDATION['line0_current_a_scaled'], atol=0.5), line0_a
-    assert np.isclose(slack_mw, PM.VALIDATION['slack_import_mw_scaled'], atol=1e-3), slack_mw
 
     # evaluate 쪽 캐시와 교차 확인
     evaluate.init_worker()
     base_flow = evaluate._get_base_flow()
     assert np.isclose(base_flow['loss']['summer_peak'][18] * 1000, PM.VALIDATION['loss_kw_scaled'], atol=0.05)
-    assert np.isclose(base_flow['p_slack']['summer_peak'][18], PM.VALIDATION['slack_import_mw_scaled'], atol=1e-3)
     print('test_base_reproduces_validation OK', loss_kw, vmin, line0_a, slack_mw)
 
 
@@ -68,15 +72,46 @@ def test_base_reproduces_validation():
 # ============================================================
 
 def test_zero_size_particle_matches_base_exactly():
-    """S=0,E=0 (둘 다) -> 편익 0, Cost 0, 위반은 기저 계통 그대로(0이 아님 - 기저 Vmin=0.9407
-    < 0.95라 이미 위반). p_slack_ess가 base_flow의 p_slack과 시나리오·시각별로 정확히 일치하는지,
-    위반량(v_violation/i_violation)도 base_flow 캐시값과 정확히 일치하는지까지 확인한다."""
+    """S=0,E=0(둘 다) -> ESS가 계통에 아무 영향도 못 주므로 실제 조류계산 결과가 base_flow와
+    시나리오·시각별로 정확히 일치해야 한다. 편익도 0, Cost도 0이다.
+
+    ★ 현행 기본값(슬랙 1.02)에서는 기저 위반량 자체가 0이다(test_base_has_no_voltage_violation
+    참조) - 그래서 "이 케이스의 v_violation이 base_flow의 v_violation과 같은가"만 비교하면
+    위반 계산 코드가 통째로 죽어 항상 0을 반환해도 0==0으로 자명하게 통과해버린다. 그래서 이
+    테스트의 핵심 비교는 절대 0이 될 수 없는 실질 물리량(슬랙 유입 MW, 손실 MW - loss_ess)으로
+    한다. 위반 계산 코드 자체가 실제로 살아 있는지는 test_base_violation_at_legacy_slack(구
+    슬랙 1.0에서 0이 아닌 값이 나오는지)이 별도로 담당한다.
+
+    ★ 검증 층위(서로 대체 불가 - 하나가 다른 하나를 커버하지 않는다):
+      (1) 물리량   p_slack_ess / loss_ess / p_ess_total -> 조류계산 경로
+      (2) 금액     b_energy / b_defer / cost / j_net    -> benefits 경로(조류계산이 안 봄)
+      (3) 분해검산 decomposition_ok                      -> 편익 분해 항등식
+      (4) 위반량   v_violation / i_violation             -> 페널티 입력(현재는 자명, 미래 대비)
+      (5) 조립     fitness 재구성                        -> 부호 규약(3-A절 ★)
+    """
     evaluate.init_worker()
     base_flow = evaluate._get_base_flow()
 
     x = np.array([10.0, 0.0, 0.0, 0.0])
     detail = evaluate.evaluate_particle(x, return_detail=True)
 
+    # ---- (1) 물리량: 조류계산 경로 -------------------------------------------------
+    # MW 단위 비교: 금액과 달리 절대 스케일이 고정(8.8MW대)이므로 atol=1e-7, rtol=0 고정
+    # (benefits.assert_slack_balance와 동일 기준 - CLAUDE.md 3절 확정값). p_slack_ess/loss_ess
+    # 둘 다 절대 0이 될 수 없는 실질 물리량이라(부하가 있는 한 손실도 항상 양수) 위반량과
+    # 달리 "우연히 0==0으로 통과"할 위험이 없다.
+    for s in PM.ALL_DAYS:
+        assert np.allclose(detail['p_slack_ess'][s], base_flow['p_slack'][s], atol=1e-7, rtol=0.0), s
+        assert np.allclose(detail['loss_ess'][s], base_flow['loss'][s], atol=1e-7, rtol=0.0), s
+
+    # 위 두 assert는 "결과가 기저와 같다"를 보는데, 이것만으로는 주입이 있었지만 상쇄되어
+    # 결과가 우연히 같아진 경우(예: 같은 시각에 충전·방전이 부호만 뒤집혀 들어감)를 배제하지
+    # 못한다. 이 assert는 "원인이 아예 없다"를 직접 본다.
+    for s in PM.ALL_DAYS:
+        assert np.allclose(detail['p_ess_total'][s], 0.0, atol=1e-7, rtol=0.0), \
+            (s, np.max(np.abs(np.asarray(detail['p_ess_total'][s]))))
+
+    # ---- (2) 금액: benefits 경로 ---------------------------------------------------
     # ★ 기대값이 정확히 0인 비교(상대오차가 의미 없는 유일한 경우)라 여기서만 절대오차를 쓴다.
     # S=0,E=0이면 물리적으로 ESS 기여가 정확히 0이어야 하지만, base_flow와 이 평가는 같은 net을
     # 재사용하면서도 직전 시각 상태(warm start 이력)가 서로 달라 뉴턴법이 tolerance_mva(기본
@@ -86,29 +121,94 @@ def test_zero_size_particle_matches_base_exactly():
     #   실험3(S=1,E=4 실사용)        diff 최대 1.2e-8 MW/시각  -> 모든 평가에 공통된 잡음
     # (c) 극단 상한 추정(실험3 최대 diff x 최고 SMP x 최대 N_WD x 24h) = 6.91원 -> 10원이면
     # 여유 있게 넉넉하다(실측 0.028원과도 정합).
+    # ※ 이 층은 물리량 비교로 대체되지 않는다 - 조류계산이 멀쩡해도 benefits가 그 값을 받아
+    #   편익을 조립하는 경로에서 버그가 나면 여기서만 걸린다. 특히 cost는 조류계산과 아무
+    #   관계가 없다(S,E만의 순수 공식).
     won_atol = 10.0
     assert abs(detail['b_energy']) < won_atol, detail['b_energy']
     assert abs(detail['b_defer']) < won_atol, detail['b_defer']
     assert detail['cost'] == 0.0, detail['cost']  # cost는 조류계산과 무관한 순수 공식이라 정확히 0
     assert abs(detail['j_net']) < won_atol, detail['j_net']
 
-    # MW 단위 비교(물리량): 금액과 달리 절대 스케일이 고정(8.8MW대)이므로 atol=1e-7,rtol=0 고정
-    # (benefits.assert_slack_balance와 동일 기준 - CLAUDE.md 3절 확정값).
-    for s in PM.ALL_DAYS:
-        assert np.allclose(detail['p_slack_ess'][s], base_flow['p_slack'][s], atol=1e-7, rtol=0.0), s
+    # ---- (3) 편익 분해 검산 --------------------------------------------------------
+    # B_arb + B_loss ≈ B_energy (CLAUDE.md 3절 "슬랙 수지 검증"). 제로 입자는 모든 항이 0이라
+    # 자명하게 통과할 것 같지만, 0-나누기나 NaN이 끼면 여기서 걸린다. detail에 이미 들어 있는
+    # 필드를 아무도 보지 않으면 그 필드가 무의미해지므로 확인한다.
+    assert detail['decomposition_ok'], \
+        (detail['b_arb'], detail['b_loss'], detail['b_energy'])
 
-    # 기저 계통 그대로이므로 0이 아닐 수 있음(Vmin=0.9407<0.95) - "0" 대신 base_flow와 정확히 대조.
-    # pu 단위 물리량(위반량)도 MW와 같은 이유로 절대오차 고정.
+    # ---- (4) 위반량 ----------------------------------------------------------------
+    # 위반량도 base_flow와 일치해야 한다(부호·스케일 실수가 있으면 여기서 어긋남) - 단
+    # "0이 아니어야 한다"는 방어는 여기서 하지 않는다. 현행 슬랙 1.02에서는 둘 다 자명하게
+    # 0이라(test_base_has_no_voltage_violation) 그 자체로는 위반 계산 코드가 살아있다는
+    # 증거가 못 된다 - 그 방어는 test_base_violation_at_legacy_slack이 담당한다.
+    # (지금은 자명하지만 지우지 말 것: 3-B절 λ 재조정이나 슬랙 재검토로 기저 위반이 다시
+    #  0이 아니게 되면 이 비교가 즉시 실질 검증으로 되살아난다.)
     assert np.isclose(detail['v_violation'], base_flow['v_violation'], atol=1e-7, rtol=0.0)
     assert np.isclose(detail['i_violation'], base_flow['i_violation'], atol=1e-7, rtol=0.0)
-    assert detail['v_violation'] > 0.0, '기저 Vmin=0.9407<0.95인데 위반량이 0으로 나옴 - 이상함'
 
-    # fitness는 위반량 지배(LAMBDA_V~1e10)라 사실상 원 단위 금액이지만 기대값이 0이 아니므로
-    # (수억원대 페널티) 상대오차로 비교한다.
-    expected_fitness = (PM.LAMBDA_V * base_flow['v_violation']
-                         + PM.LAMBDA_LINE * base_flow['i_violation'])
-    assert np.isclose(detail['fitness'], expected_fitness, rtol=1e-9, atol=0.0), (detail['fitness'], expected_fitness)
-    print('test_zero_size_particle_matches_base_exactly OK', detail['v_violation'], detail['i_violation'])
+    # ---- (5) fitness 조립 ----------------------------------------------------------
+    # fitness = -j_net + LAMBDA_V*v_violation + LAMBDA_LINE*i_violation (evaluate.py 소스와
+    # 동일한 항 순서). base_flow가 아니라 detail 자신이 반환한 j_net/v_violation/i_violation로
+    # 재구성한다 - base_flow는 별도의 조류계산(다른 warm-start 이력)이라 그걸 기준으로 삼으면
+    # 그 자체의 미세한 부동소수 차이가 섞인다. 여기서는 같은 evaluate_particle 호출 안에서
+    # 나온 값들끼리만 비교하므로 원칙적으로 정확히 같아야 한다(수식을 소스와 동일한 순서로
+    # 재현하면 IEEE754 연산은 결정적이라 비트까지 같다). atol=1e-9는 "==" 대신 쓰는 안전장치 -
+    # evaluate.py가 나중에 항 순서를 바꾸는 무해한 리팩터로도 "=="는 깨질 수 있는데(덧셈은
+    # 결합법칙이 성립 안 함), 실제 버그의 오차 규모(수 원~수십억 원)와는 비교가 안 되게
+    # 작은 값이라 검출력은 그대로다(CLAUDE.md 7절 원칙 2 - 구현 디테일이 아니라 물리로 검증).
+    # ※ 자기참조라 검증력은 낮지만, 3-A절 ★이 경고한 부호 실수(-J_net을 +J_net으로)는
+    #   이 층에서만 잡힌다.
+    expected_fitness_internal = (-detail['j_net']
+                                  + PM.LAMBDA_V * detail['v_violation']
+                                  + PM.LAMBDA_LINE * detail['i_violation'])
+    assert np.isclose(detail['fitness'], expected_fitness_internal, rtol=0.0, atol=1e-9), \
+        (detail['fitness'], expected_fitness_internal)
+
+    print('test_zero_size_particle_matches_base_exactly OK',
+          detail['v_violation'], detail['i_violation'])
+
+
+def test_base_has_no_voltage_violation():
+    """CLAUDE.md 3-B절 1차 조치("슬랙 1.02로 기저 위반 제거")의 핵심 주장을 독립 테스트로
+    명시한다: 현행 기본값(슬랙 1.02, params.SLACK_VM_PU)에서 ESS 없는 기저 조류계산의
+    v_violation/i_violation이 정확히 0이어야 한다(scripts/probe_voltage.py 실측 - measurement1,
+    PM.VALIDATION['v_violation_total_scaled']=0.0과 일치)."""
+    evaluate.init_worker()
+    base_flow = evaluate._get_base_flow()
+
+    assert base_flow['v_violation'] < 1e-9, base_flow['v_violation']
+    assert base_flow['i_violation'] < 1e-9, base_flow['i_violation']
+    assert np.isclose(base_flow['v_violation'], PM.VALIDATION['v_violation_total_scaled'], atol=1e-9)
+    print('test_base_has_no_voltage_violation OK', base_flow['v_violation'], base_flow['i_violation'])
+
+
+def test_base_violation_at_legacy_slack():
+    """구 슬랙 전압(1.0)에서는 v_violation이 0이 아니어야 한다(CLAUDE.md 1절 표,
+    PM.VALIDATION_LEGACY_SLACK_1P0 참조).
+
+    ★ 왜 필요한가: 현행 기본값(슬랙 1.02)에서는 정상 경로의 v_violation이 test_base_has_
+    no_voltage_violation을 포함해 이 파일 어디서도 항상 0이다. 위반 계산 코드가 버그로
+    (예: 부호가 뒤집혀 항상 0을 반환하거나, V_MIN/V_MAX를 잘못 참조해도) 항상 0을 내놓으면
+    그 버그가 있어도 다른 모든 테스트가 그대로 통과한다. 구 슬랙(1.0)에서 실측값(probe_voltage.py,
+    0.9169pu)과 가까운 0이 아닌 값이 실제로 나오는 것을 확인해야 그 계산 경로가 살아
+    있음이 보장된다 - CLAUDE.md 7절 테스트 설계 원칙 5(회귀 방지)와 같은 취지.
+
+    허용오차: PM.VALIDATION_LEGACY_SLACK_1P0의 0.9169는 probe_voltage.py 실측값(0.916866)의
+    유효숫자 4자리 반올림이라, 반올림 오차(~3.4e-5)보다 넉넉한 여유를 두어 atol=1e-3으로 둔다
+    (CLAUDE.md 7절 원칙 4 - 물리적 근거 있는 값, 임의로 조이지 않음).
+    """
+    net = build_net(slack_vm_pu=1.0)
+    base_p = net.load['p_mw'].to_numpy().copy()
+    base_q = net.load['q_mvar'].to_numpy().copy()
+    base_flow = evaluate._compute_base_flow(net, base_p, base_q)
+
+    expected = PM.VALIDATION_LEGACY_SLACK_1P0['v_violation_total_scaled']
+    assert base_flow['v_violation'] > 0.0, \
+        f"구 슬랙(1.0)에서도 v_violation=0 - 위반 계산 경로가 죽어있을 위험, 재확인 필요 ({base_flow['v_violation']})"
+    assert np.isclose(base_flow['v_violation'], expected, atol=1e-3, rtol=0.0), \
+        (base_flow['v_violation'], expected)
+    print('test_base_violation_at_legacy_slack OK', base_flow['v_violation'])
 
 
 def test_zero_S_or_E_alone_gives_zero_operational_benefit_but_nonzero_cost():
@@ -257,6 +357,8 @@ def test_and_report_single_evaluation_timing():
 if __name__ == '__main__':
     test_base_reproduces_validation()
     test_zero_size_particle_matches_base_exactly()
+    test_base_has_no_voltage_violation()
+    test_base_violation_at_legacy_slack()
     test_zero_S_or_E_alone_gives_zero_operational_benefit_but_nonzero_cost()
     test_realistic_particle_balance_and_decomposition()
     test_divergence_returns_penalty_not_exception()

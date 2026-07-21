@@ -14,7 +14,7 @@ import pandas as pd
 import pandapower as pp
 
 from build_net import build_net
-from params import LOAD
+from params import LOAD, VALIDATION
 
 
 def section(title):
@@ -72,11 +72,16 @@ def main():
     line0_current_a = net.res_line.at[0, 'i_ka'] * 1000
     slack_mw = net.res_ext_grid.at[0, 'p_mw']
 
+    # 검증값은 params.VALIDATION을 그대로 참조한다(리터럴로 다시 박지 않음 - build_net.py
+    # __main__과 동일 원칙). 슬랙 전압이 바뀌면 이 스크립트도 값을 다시 타이핑할 필요 없이
+    # 자동으로 새 기준값을 따라간다.
     print(f'\n0번 검증값 재현:')
-    print(f'  총손실: {total_loss_kw:.2f} kW (검증값 310.06 kW)')
-    print(f'  Vmin: {vmin:.4f} pu, bus {vmin_bus} (검증값 0.9407 pu, bus 17)')
-    print(f'  주간선 전류(line 0): {line0_current_a:.2f} A (검증값 261.51 A)')
-    print(f'  슬랙 유입: {slack_mw:.4f} MW (검증값 8.8125 MW)')
+    print(f"  총손실: {total_loss_kw:.2f} kW (검증값 {VALIDATION['loss_kw_scaled']} kW)")
+    print(f"  Vmin: {vmin:.4f} pu, bus {vmin_bus} "
+          f"(검증값 {VALIDATION['vmin_pu_scaled']} pu, bus {VALIDATION['vmin_bus']})")
+    print(f"  주간선 전류(line 0): {line0_current_a:.2f} A (검증값 {VALIDATION['line0_current_a_scaled']} A)")
+    print(f'  슬랙 유입: {slack_mw:.4f} MW (참고용 - 부하 프로파일·슬랙 전압에 따라 달라져 '
+          '단일 검증값으로 쓰지 않음, CLAUDE.md 1절)')
 
     # ------------------------------------------------------------------
     # 3. ESS 주입 상태에서 재확인

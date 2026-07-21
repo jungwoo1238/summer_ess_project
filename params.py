@@ -8,7 +8,13 @@ import numpy as np
 # 1. 계통 (CLAUDE.md 1절)
 # ============================================================
 VN_KV = 22.9                # net.bus.vn_kv 스케일 대상 전압
-EXT_GRID_VM_PU = 1.0        # net.ext_grid.vm_pu
+
+# ★ 슬랙(변전소) 전압. 2026-07 3차 개정: 1.0 -> 1.02. vm_pu=1.0에서는 ESS 미설치 기저상태가
+# 이미 전압 하한을 위반한다(Vmin=0.9407<0.95, 총 위반량 0.9169pu - scripts/probe_voltage.py
+# 실측, CLAUDE.md 1절/3-B절). 1.02는 변전소 OLTC의 통상적 탭 설정에 해당하며 이 지점부터
+# 기저 위반이 0이 된다(스윕 실측: 1.01에서 이미 0). build_net()의 slack_vm_pu 인자 기본값이며,
+# 구 값(1.0) 재현은 build_net(slack_vm_pu=1.0)으로 한다(VALIDATION_LEGACY_SLACK_1P0 참조).
+SLACK_VM_PU = 1.02
 SLACK_BUS = 0
 N_BUS = 33
 
@@ -22,14 +28,35 @@ LINE_RATINGS_A = {
 }
 LINE_RATING_DEFAULT_A = 222   # 나머지 5~31 (27개 선로) ACSR-OC 58mm^2
 
-# 계통 검증값 (build_net.py 자체검증용, CLAUDE.md 1절 표. 반드시 재현되어야 함)
+# 계통 검증값 (build_net.py 자체검증용, CLAUDE.md 1절 표. 반드시 재현되어야 함).
+# 조건: build_net()으로 만든 net에 부하 프로파일을 전혀 적용하지 않은 단일 스냅샷
+# (= LOAD['summer_peak'][18]=1.0과 수학적으로 동일한 지점, 5절 참조) 기준 - 단
+# 'v_violation_total_scaled'만 예외로 ALL_DAYS x 24h 전체 집계값이다(evaluate.py 페널티
+# 정의와 동일 - CLAUDE.md 7절). 슬랙 전압 1.02(SLACK_VM_PU) 기준, 2026-07 3차 재산출
+# (scripts/probe_voltage.py 실측 - measurement1/measurement3 값과 정확히 일치 확인됨).
 VALIDATION = {
-    'loss_kw_orig_12_66kv': 202.68,
+    'loss_kw_orig_12_66kv': 202.68,   # 원본 12.66kV(스케일링 이전) - 슬랙전압과 무관, 불변
+    'loss_kw_scaled': 296.86,
+    'vmin_pu_scaled': 0.9620,
+    'vmin_bus': 17,
+    'line0_current_a_scaled': 255.99,
+    'max_line_utilization_scaled': 0.6244,
+    'v_violation_total_scaled': 0.0,   # ALL_DAYS x 24h 집계 (스냅샷 아님 - 위 설명 참조)
+}
+
+# 구 슬랙 전압(1.0, 2026-07 3차 개정 이전 기본값) 기준 회귀용 검증값. CLAUDE.md 1절 표 참조.
+# build_net(slack_vm_pu=1.0)으로 재현 확인(test_evaluate.py::test_base_violation_at_legacy_slack).
+# 위 VALIDATION과 키 구성이 같다(단 'loss_kw_orig_12_66kv'는 슬랙전압 무관이라 여기 없음).
+VALIDATION_LEGACY_SLACK_1P0 = {
     'loss_kw_scaled': 310.06,
     'vmin_pu_scaled': 0.9407,
     'vmin_bus': 17,
     'line0_current_a_scaled': 261.51,
-    'slack_import_mw_scaled': 8.8125,
+    'slack_import_mw_scaled': 8.8125,   # 참고용(부하 프로파일·슬랙전압에 둘 다 의존 - 1절
+                                          # 참조, 현행 VALIDATION에는 이 키가 없음. 수지식으로
+                                          # 검증하는 것이 원칙 - CLAUDE.md 3절 슬랙 수지 검증).
+    'max_line_utilization_scaled': 0.6378,
+    'v_violation_total_scaled': 0.9169,   # ALL_DAYS x 24h 집계
 }
 
 # ============================================================
