@@ -358,9 +358,13 @@ def final_verdict(grid_rows, peak_rows):
 # ============================================================
 
 def _make_path(suffix):
+    """scripts/ 바로 아래가 아니라 scripts/results/probe_large_solutions/ 밑에 모아 둔다
+    (스크립트별 결과 CSV가 늘어나며 scripts/가 난잡해지는 것을 막기 위함)."""
+    out_dir = os.path.join(SCRIPT_DIR, 'results', 'probe_large_solutions')
+    os.makedirs(out_dir, exist_ok=True)
     hostname = socket.gethostname()
     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    return os.path.join(SCRIPT_DIR, f'probe_large_solutions_{suffix}_{hostname}_{ts}.csv')
+    return os.path.join(out_dir, f'probe_large_solutions_{suffix}_{hostname}_{ts}.csv')
 
 
 def _write_csv(path, fields, rows):
