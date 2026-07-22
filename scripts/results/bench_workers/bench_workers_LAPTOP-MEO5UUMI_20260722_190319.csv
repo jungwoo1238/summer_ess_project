@@ -1,0 +1,1 @@
+n_workers,n_particles,rounds,gen_time_best_s,gen_time_min_s,gen_time_max_s,time_per_particle_s,eval_time_std_s,n_diverged,peak_rss_mb,status,error
