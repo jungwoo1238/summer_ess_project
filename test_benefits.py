@@ -272,6 +272,42 @@ def test_b_loss_can_be_negative():
     print('test_b_loss_can_be_negative OK', val)
 
 
+def test_loss_pcs_hand_calc_reference_table():
+    """CMD_pcs_loss.md 2절 참고 수치 표 재현 (eta_pcs=0.97=params.ETA_PCS 기본값).
+    Loss_pcs = (1-eta)*[sqrt(P^2+Q^2) - |P|]."""
+    p_net = {'x': np.array([0.00, 0.14, 0.00])}
+    q_mvar = {'x': np.array([1.20, 1.20, 1.68])}
+    result = benefits.loss_pcs(p_net, q_mvar)
+    expected = np.array([0.0360, 0.0320, 0.0504])
+    assert np.allclose(result['x'], expected, atol=1e-3), result['x']
+    print('test_loss_pcs_hand_calc_reference_table OK', result['x'])
+
+
+def test_loss_pcs_zero_when_q_zero():
+    """Q=0이면 P가 무엇이든 정확히 0 (삼각부등식 - 회귀 안전성의 근거)."""
+    p_net = {'a': np.array([-2.4, -0.5, 0.0, 0.5, 2.4])}
+    q_mvar = {'a': np.zeros(5)}
+    result = benefits.loss_pcs(p_net, q_mvar)
+    assert np.allclose(result['a'], 0.0, atol=0.0), result['a']
+    print('test_loss_pcs_zero_when_q_zero OK')
+
+
+def test_loss_pcs_custom_eta_and_key_mismatch_raises():
+    """eta_pcs 오버라이드가 실제로 반영되는지 + p_net/q_mvar 시나리오 키가 다르면 즉시 실패."""
+    p_net = {'a': np.array([0.0])}
+    q_mvar = {'a': np.array([1.0])}
+    result = benefits.loss_pcs(p_net, q_mvar, eta_pcs=0.9)
+    assert np.isclose(result['a'][0], 0.1), result['a']  # (1-0.9)*(1.0-0.0)=0.1
+
+    try:
+        benefits.loss_pcs({'a': np.array([0.0])}, {'b': np.array([0.0])})
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised, '시나리오 키 불일치인데 에러가 안 남'
+    print('test_loss_pcs_custom_eta_and_key_mismatch_raises OK')
+
+
 def test_check_b_energy_decomposition_detects_mismatch():
     assert benefits.check_b_energy_decomposition(100.0, 50.0, 150.0) is True
     assert benefits.check_b_energy_decomposition(100.0, 50.0, 200.0) is False
@@ -293,5 +329,8 @@ if __name__ == '__main__':
     test_assert_slack_balance_missing_key_raises()
     test_arb_loss_energy_identity_on_consistent_data()
     test_b_loss_can_be_negative()
+    test_loss_pcs_hand_calc_reference_table()
+    test_loss_pcs_zero_when_q_zero()
+    test_loss_pcs_custom_eta_and_key_mismatch_raises()
     test_check_b_energy_decomposition_detects_mismatch()
     print('all benefits tests passed')

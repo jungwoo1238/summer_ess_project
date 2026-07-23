@@ -92,7 +92,7 @@ def test_zero_size_particle_matches_base_exactly():
     evaluate.init_worker()
     base_flow = evaluate._get_base_flow()
 
-    x = np.array([10.0, 0.0, 0.0, 0.0])
+    x = np.array([10.0, 0.0, 0.0])
     detail = evaluate.evaluate_particle(x, return_detail=True)
 
     # ---- (1) 물리량: 조류계산 경로 -------------------------------------------------
@@ -211,19 +211,56 @@ def test_base_violation_at_legacy_slack():
     print('test_base_violation_at_legacy_slack OK', base_flow['v_violation'])
 
 
-def test_zero_S_or_E_alone_gives_zero_operational_benefit_but_nonzero_cost():
-    """S=0(E>0) 또는 E=0(S>0) 단독이어도 스케줄은 0(lower_lp의 S<=0 or E<=0 조기 반환)이라
-    운영 편익(B_energy/B_defer)은 0이지만, Cost는 CAPEX(S,E) 공식대로 계산되므로 0이 아닐 수
-    있다 - "편익 0"과 "Cost 0"을 같은 조건으로 뭉뚱그리면 안 된다는 것을 명시적으로 검증."""
-    # 기대값이 정확히 0인 경우의 예외적 절대오차 - 근거는 test_zero_size_particle_matches_base_exactly
-    # 상단 주석 및 scripts/probe_noise.py 참조(워밍스타트 이력 차이에 의한 조류계산 수렴오차).
-    won_atol = 10.0
-    for x in (np.array([10.0, 0.0, 5.0, 0.0]), np.array([10.0, 1.0, 0.0, 0.0])):
-        detail = evaluate.evaluate_particle(x, return_detail=True)
-        assert abs(detail['b_energy']) < won_atol, (x, detail['b_energy'])
-        assert abs(detail['b_defer']) < won_atol, (x, detail['b_defer'])
-        assert detail['cost'] > 0.0, (x, detail['cost'])
-    print('test_zero_S_or_E_alone_gives_zero_operational_benefit_but_nonzero_cost OK')
+def test_zero_S_alone_gives_negligible_operational_benefit_but_nonzero_cost():
+    """S=0(E>0)이면 스케줄은 근사 0(정확히 0은 아님 - lower_lp의 자기방전 상쇄 바닥 때문,
+    test_lp.py test_avg_zero_power_no_benefit과 동일 근거)이라 운영 편익(B_energy/B_defer)도
+    근사 0이지만, Cost는 CAPEX(S,E) 공식대로 계산되므로 0이 아닐 수 있다 - "편익 0"과
+    "Cost 0"을 같은 조건으로 뭉뚱그리면 안 된다는 것을 명시적으로 검증.
+
+    ★ 편입 전에는 S<=0 OR E<=0 어느 쪽이든 lower_lp가 LP를 아예 안 부르고 0을 반환했다
+    (조기 반환). 지금은 조인트 LP라 그 조기반환이 없다 - E=0 단독(S>0)은 **더 이상 이
+    가정에 포함되지 않는다**(아래 test_e_zero_alone_can_have_real_q_only_benefit 참조,
+    별도 테스트로 분리 - S=0과는 성격이 다른 발견이라 병합하면 오해를 부른다)."""
+    won_atol = 200000.0  # ★ 아래 참조: 자기방전 상쇄 바닥(lower_lp._s_floor_for_self_discharge)이
+    # 실제 SMP로 차익거래·이연에 쓰이면서 leak - E=5, margin=1.1 기준 실측 b_energy~-1.6천원,
+    # b_defer~14.5만원(주로 b_defer, c_cap이 원/MW-yr 단위로 커서(76,082,200) 아주 작은 S바닥도
+    # 증폭됨). 최적해 j_net(~3e6원) 대비 5% 미만이라 "무시할 만함"의 기준으로 20만원을 쓴다
+    # (test_lp.py의 0.002MW atol과 같은 계보 - 여기서는 금액 단위로 환산한 것).
+    x = np.array([10.0, 0.0, 5.0])
+    detail = evaluate.evaluate_particle(x, return_detail=True)
+    assert abs(detail['b_energy']) < won_atol, (x, detail['b_energy'])
+    assert abs(detail['b_defer']) < won_atol, (x, detail['b_defer'])
+    assert detail['cost'] > 0.0, (x, detail['cost'])
+    print('test_zero_S_alone_gives_negligible_operational_benefit_but_nonzero_cost OK',
+          detail['b_energy'], detail['b_defer'])
+
+
+def test_e_zero_alone_can_have_real_q_only_benefit():
+    """★ C.6-3 신규 발견(버그 아님, 검증 필요 표시): E=0(S>0)은 더 이상 "비활성 기"가
+    아니다. E=0이면 SOC가 0에 고정돼 실효 P(유효전력)는 자기방전 바닥 수준(~1e-9 MW)으로
+    묶이지만, **Q(무효전력)는 E와 무관하게 다각형 제약(S 기준)만 따른다** - PCS가 배터리
+    없이도 순수 STATCOM처럼 무효전력만 공급할 수 있다는 뜻이고, 물리적으로 타당하다(무효
+    전력은 배터리 셀이 아니라 인버터가 만든다). 실측(S=1MVA,E=0,bus=10,summer 등 실데이터):
+    P_net~2e-9MW(자명), Q는 최대 ~0.6MVAr까지 사용 - 그 결과 b_energy/b_defer가 수백만원대로
+    **0이 아니다**(이 스크립트 작성 시점 실측: b_energy~983만원, b_defer~164만원, cost~301만원,
+    j_net~846만원 - 부록C.7의 "R/X 高 배전망이라 Q 효과가 제한적"이라는 정성적 기대와
+    자릿수가 안 맞아 보이므로, PSO가 실제로 이 방향(대형 S·E=0 순수 무효보상)으로 수렴하는지
+    dev 실행에서 반드시 확인할 것 - 확인 전까지는 부호·크기 모두 참고용."""
+    x = np.array([10.0, 1.0, 0.0])
+    detail = evaluate.evaluate_particle(x, return_detail=True)
+    assert detail['diverged'] is False
+    assert detail['cost'] > 0.0, detail['cost']
+    # ★ P(유효전력)가 정확히 0에 가까울 것이라 기대했으나(E=0->SOC=0 고정) 실측은
+    # 그렇지 않았다(최대 ~0.05MW, S=1MW의 5%) - 다각형 제약의 "Q 최대치" 변은 P가 어느
+    # 한 점이 아니라 구간([-0.26S,+0.26S] 부근)에서 폭넓게 degenerate하기 때문(그 구간
+    # 안에서는 Q=S*cos(15°)로 동일하게 최대라 목적함수가 P값 자체엔 무차별 - solve_peak
+    # 관련 기존 degenerate 테스트들과 같은 성격의 현상). 그래서 강한 상한(1e-3) 대신
+    # 물리적으로 항상 성립해야 하는 느슨한 상한(|P|<=S)만 확인한다.
+    p_ess_max = max(float(np.max(np.abs(detail['p_ess_total'][s]))) for s in PM.ALL_DAYS)
+    assert p_ess_max <= 1.0 + 1e-2, p_ess_max
+    print('test_e_zero_alone_can_have_real_q_only_benefit OK (참고용 수치) '
+          f"b_energy={detail['b_energy']:.0f} b_defer={detail['b_defer']:.0f} "
+          f"cost={detail['cost']:.0f} j_net={detail['j_net']:.0f} p_ess_max={p_ess_max:.2e}")
 
 
 # ============================================================
@@ -235,7 +272,7 @@ def test_realistic_particle_balance_and_decomposition():
     evaluate_particle 내부에서 assert_slack_balance(atol=1e-7, rtol=0, ALL_DAYS 전부)가
     이미 통과해야 예외 없이 반환되므로, 예외 없이 detail이 나오는 것 자체가 3번 항목의 증거다.
     b_arb+b_loss ~= b_energy는 detail['decomposition_ok']로 별도 확인."""
-    x = np.array([17.0, 1.0, 4.0, 0.0])
+    x = np.array([17.0, 1.0, 4.0])
     detail = evaluate.evaluate_particle(x, return_detail=True)
 
     assert detail['diverged'] is False
@@ -270,7 +307,7 @@ def test_divergence_returns_penalty_not_exception():
 
     evaluate.pp.runpp = _always_raise
     try:
-        x = np.array([10.0, 1.0, 4.0, 0.0])
+        x = np.array([10.0, 1.0, 4.0])
         fitness = evaluate.evaluate_particle(x)
         detail = evaluate.evaluate_particle(x, return_detail=True)
     finally:
@@ -298,9 +335,9 @@ def test_divergence_returns_penalty_not_exception():
 
 def test_fitness_always_finite_scalar():
     particles = [
-        np.array([1.0, 0.0, 0.0, 0.0]),
-        np.array([32.0, 2.4, 10.2, 0.0]),
-        np.array([17.0, 1.2, 5.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+        np.array([32.0, 2.4, 10.2]),
+        np.array([17.0, 1.2, 5.0]),
     ]
     for x in particles:
         fitness = evaluate.evaluate_particle(x)
@@ -314,13 +351,13 @@ def test_fitness_always_finite_scalar():
 # ============================================================
 
 def test_multi_unit_n1_and_n2_structural():
-    x1 = np.array([17.0, 1.0, 4.0, 0.0])
+    x1 = np.array([17.0, 1.0, 4.0])
     detail1 = evaluate.evaluate_particle(x1, return_detail=True)
     assert detail1['b'].shape == (1,)
     assert detail1['unit_p']['summer'].shape == (1, PM.TIME_STEPS)
 
     # n=2, 서로 다른 버스
-    x2 = np.array([17.0, 1.0, 4.0, 0.0, 25.0, 0.5, 2.0, 0.0])
+    x2 = np.array([17.0, 1.0, 4.0, 25.0, 0.5, 2.0])
     detail2 = evaluate.evaluate_particle(x2, return_detail=True)
     assert detail2['diverged'] is False
     assert detail2['b'].shape == (2,)
@@ -328,7 +365,7 @@ def test_multi_unit_n1_and_n2_structural():
     assert list(detail2['b']) == [17, 25]
 
     # n=2, 동일 버스 중복배치 ((a)방식: sgen 2개 별도 생성, 병합 안 함)
-    x_dup = np.array([17.0, 1.0, 4.0, 0.0, 17.0, 0.8, 3.0, 0.0])
+    x_dup = np.array([17.0, 1.0, 4.0, 17.0, 0.8, 3.0])
     detail_dup = evaluate.evaluate_particle(x_dup, return_detail=True)
     assert detail_dup['diverged'] is False
     assert list(detail_dup['b']) == [17, 17]
@@ -343,7 +380,7 @@ def test_multi_unit_n1_and_n2_structural():
 
 def test_and_report_single_evaluation_timing():
     evaluate.init_worker()  # 워밍업(기저 조류계산은 시간 측정에서 제외)
-    x = np.array([17.0, 1.0, 4.0, 0.0])
+    x = np.array([17.0, 1.0, 4.0])
     evaluate.evaluate_particle(x)  # JIT/캐시 워밍업 1회
 
     t0 = time.perf_counter()
@@ -359,7 +396,8 @@ if __name__ == '__main__':
     test_zero_size_particle_matches_base_exactly()
     test_base_has_no_voltage_violation()
     test_base_violation_at_legacy_slack()
-    test_zero_S_or_E_alone_gives_zero_operational_benefit_but_nonzero_cost()
+    test_zero_S_alone_gives_negligible_operational_benefit_but_nonzero_cost()
+    test_e_zero_alone_can_have_real_q_only_benefit()
     test_realistic_particle_balance_and_decomposition()
     test_divergence_returns_penalty_not_exception()
     test_fitness_always_finite_scalar()

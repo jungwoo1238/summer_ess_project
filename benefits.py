@@ -54,6 +54,34 @@ def assert_slack_balance(p_slack, load_sum, loss, p_ess, scenarios=None, atol=1e
             )
 
 
+def loss_pcs(p_net, q_mvar, eta_pcs=None):
+    """PCS(인버터) 무효전력 변환손실 [MW] (CMD_pcs_loss.md, 2026-07 - b_loss 폭증 원인 수정).
+
+    Loss_pcs[s] = (1 - eta_pcs) * [ sqrt(P[s]^2 + Q[s]^2) - |P[s]| ]
+
+    유효전력 경로의 PCS 손실은 이미 RTE 0.90(ETA_C*ETA_D, 시스템 레벨 AC-to-AC 효율)에
+    반영돼 있으므로, 여기서는 **무효전력이 유발한 증분**(피상전력 - |P|)에만 건다
+    (이중계상 방지 - CMD_pcs_loss.md 2절). Q=0이면 삼각부등식에 의해 정확히 0이 되어
+    회귀 안전성이 보장된다(force_q_zero=True 경로와 정합).
+
+    p_net/q_mvar: dict[str, ndarray] - 시나리오 그룹 무관(ALL_DAYS 전부에 적용 가능하므로
+    AVG_DAYS/PEAK_DAYS를 하드코딩하지 않고 입력에 있는 키를 그대로 순회한다 - 다른 benefits.py
+    함수들과 달리 이 함수는 편익 집계가 아니라 evaluate.py가 실제 sgen 주입값을 만드는 데
+    쓰는 물리량이라 특정 시나리오군에 묶이지 않는다).
+    """
+    eta = PM.ETA_PCS if eta_pcs is None else eta_pcs
+    assert set(p_net.keys()) == set(q_mvar.keys()), \
+        f'p_net/q_mvar 시나리오 키가 다름: {set(p_net.keys())} vs {set(q_mvar.keys())}'
+
+    result = {}
+    for s in p_net.keys():
+        P = np.asarray(p_net[s])
+        Q = np.asarray(q_mvar[s])
+        apparent = np.sqrt(P ** 2 + Q ** 2)
+        result[s] = (1.0 - eta) * (apparent - np.abs(P))
+    return result
+
+
 def b_energy(p_slack_base, p_slack_ess, smp_mwh, n_weekdays):
     """B_energy (CLAUDE.md 3절): 손실 편익 + 조달비를 이중계상 없이 함께 잡는다.
     Sigma_{s in AVG_DAYS} N_WD[s] * Sigma_t (P_slack_base[s,t] - P_slack_ess[s,t]) * SMP[s,t] * dt

@@ -10,13 +10,10 @@ benefits -> evaluate -> **main** -> postprocess).
 조정한 뒤 n=2로 넘어가는 식이라 기본은 한 번에 한 기수만 돈다. --n-ess에 콤마 리스트를
 명시하면 여러 기수를 순차 실행할 수 있지만 기본값은 항상 단일 정수 1이다.
 
-PSO 탐색 차원은 3n(b,S,E)이지 4n이 아니다 - q_ratio는 뼈대에서 PSO 변수가 아니라 상수
-0으로 고정된다(CLAUDE.md 2절 "뼈대에서는 q_ratio 경계를 [0,0]으로 고정"). 이걸 PSO
-경계 (0.0, 0.0)으로 넣지 않고 아예 차원에서 뺀 이유: pso_core의 rng.uniform(lo, hi)는
-lo==hi인 차원에서도 난수를 소비하므로, 나중에 진짜 3n 차원으로(부록C q_ratio 제거 이후에도
-차원 수가 같아지는 상황) 돌린 결과와 난수 스트림이 어긋나 재현 비교가 불가능해진다.
-evaluate.py는 현재 4n 시그니처(b,S,E,q_ratio)를 그대로 유지하므로(수정 금지), main이
-평가 직전 q=0.0 열을 붙여 3n -> 4n으로 변환하는 어댑터(_expand_to_4n)를 둔다.
+PSO 탐색 차원은 3n(b,S,E)이다. ★ C.6-3(LinDistFlow 편입) 이후 evaluate.py 자신이 3n
+시그니처로 바뀌어(Q는 이제 하위 LP의 시변 변수라 상위 PSO에 q_ratio가 없다 - 부록C.4-(3))
+main의 _expand_to_4n 어댑터는 제거했다. main은 pso_core가 반환하는 3n 배열을
+evaluate.evaluate_particle에 그대로 넘긴다.
 
 ★ runs.csv의 편익 분해·페널티 컬럼(j_net/b_energy/.../penalty_v/penalty_line)은 --diagnose
 여부와 무관하게 항상 기록한다. full 프로파일(30 run)에서 --diagnose가 stdout에 30줄을
@@ -143,7 +140,7 @@ def _check_env():
 
 
 # ============================================================
-# 3n <-> 4n 어댑터 (evaluate.py 미수정 - 위 모듈 docstring 참조)
+# 3n 경계 구성 (evaluate.py도 3n 시그니처 - C.6-3 이후 어댑터 불필요)
 # ============================================================
 
 def _build_bounds(n_ess):
@@ -157,20 +154,11 @@ def _build_int_dims(n_ess):
     return [3 * i for i in range(n_ess)]
 
 
-def _expand_to_4n(row_3n, n_ess):
-    """(b,S,E) x n_ess(3n) -> (b,S,E,q_ratio=0.0) x n_ess(4n). evaluate.evaluate_particle의
-    현재 시그니처에 맞추는 어댑터. q_ratio=0.0은 CLAUDE.md 2절 뼈대 확정값(Q=0)."""
-    x3 = np.asarray(row_3n, dtype=float).reshape(n_ess, 3)
-    x4 = np.zeros((n_ess, 4), dtype=float)
-    x4[:, :3] = x3
-    return x4.reshape(-1)
-
-
 # ============================================================
 # 워커에서 실행되는 평가 함수 (Pool.map 대상 - 반드시 모듈 최상위, 피클 가능해야 함)
 # ============================================================
 
-def _eval_for_pso(x4n):
+def _eval_for_pso(x3n):
     """evaluate.evaluate_particle을 return_detail=True로 호출해 (fitness, diverged, b_defer)
     3튜플만 돌려준다. 전체 dict를 그대로 IPC로 돌려보내면 p_slack_ess/loss_ess/unit_p/unit_q
     등 이 스크립트가 쓰지 않는 배열까지 매 평가마다 pickling되므로, 필요한 스칼라만 추린다.
@@ -178,7 +166,7 @@ def _eval_for_pso(x4n):
     발산 누적은 탐색 전체에 걸쳐 기록해야 사후 복원이 가능하다(최적해 하나만으로는 탐색 중
     발생 여부를 알 수 없음) - fitness 스칼라만 반환하는 경로로는 이 정보에 접근할 수 없다.
     """
-    detail = evaluate.evaluate_particle(x4n, return_detail=True)
+    detail = evaluate.evaluate_particle(x3n, return_detail=True)
     if detail.get('diverged'):
         return detail['fitness'], True, None
     return detail['fitness'], False, detail['b_defer']
@@ -208,10 +196,10 @@ class RunObjective:
 
     def __call__(self, X):
         X = np.asarray(X, dtype=float)
-        particles_4n = [_expand_to_4n(row, self.n_ess) for row in X]
+        particles_3n = [np.asarray(row, dtype=float) for row in X]
 
         t0 = time.perf_counter()
-        results = self.pool.map(_eval_for_pso, particles_4n, chunksize=1)
+        results = self.pool.map(_eval_for_pso, particles_3n, chunksize=1)
         elapsed_s = time.perf_counter() - t0
 
         fitness = np.empty(len(results), dtype=float)
@@ -262,12 +250,11 @@ def _append_csv_rows(path, fields, rows):
 # gbest 해의 편익 분해·페널티 (runs.csv에 상시 기록 - 확정 사항 2) 참조)
 # ============================================================
 
-def _evaluate_gbest_detail(n_ess, gbest_x_3n):
+def _evaluate_gbest_detail(gbest_x_3n):
     """run 종료 후 gbest 해 1개에 대해서만 evaluate_particle(return_detail=True)를 호출한다
     (전 입자 기록은 안 함). 부록B의 LAMBDA_V/LAMBDA_LINE/PENALTY_DIVERGE가 전부 "잠정값,
     첫 실행 로그 보고 조정"이므로 이 값을 볼 수단이 CSV에도 항상 남아 있어야 한다."""
-    x4n = _expand_to_4n(gbest_x_3n, n_ess)
-    return evaluate.evaluate_particle(x4n, return_detail=True)
+    return evaluate.evaluate_particle(np.asarray(gbest_x_3n, dtype=float), return_detail=True)
 
 
 def _gbest_detail_to_run_fields(detail, gbest_f):
@@ -393,7 +380,7 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
             gbest_f = float(result['f'])
 
             # ★ --diagnose 여부와 무관하게 항상 계산·기록 (확정 사항 2)).
-            gbest_detail = _evaluate_gbest_detail(n_ess, result['x'])
+            gbest_detail = _evaluate_gbest_detail(result['x'])
             benefit_fields = _gbest_detail_to_run_fields(gbest_detail, gbest_f)
 
             run_row = dict(

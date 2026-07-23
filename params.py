@@ -65,7 +65,8 @@ VALIDATION_LEGACY_SLACK_1P0 = {
 B_BOUNDS = (1, 32)          # 정수, 슬랙(bus 0) 제외, 연속값 반올림
 S_BOUNDS = (0.0, 2.4)       # MVA (충전여유 2,473kW -> 2.4, DoD 무관)
 E_BOUNDS = (0.0, 10.2)      # MWh (x_max=4.234*S 살짝 상회, 조달비 포함 재산정)
-Q_RATIO_BOUNDS = (0.0, 1.0)     # 뼈대는 (0.0, 0.0)로 고정해 사용 (Q=0)
+# ★ Q_RATIO_BOUNDS 제거 (C.6-3 LinDistFlow 편입, 2026-07). Q는 이제 하위 LP의 시변 변수라
+# 상위(PSO) 경계가 필요 없다 - CLAUDE.md 부록C.4-(3).
 
 # ============================================================
 # 3. 하위 LP / 시간해상도 / SOC (CLAUDE.md 2절 하위, 4절)
@@ -82,10 +83,36 @@ DOD = 0.90                   # = SOC_MAX_FRAC - SOC_MIN_FRAC
 ETA_C = 0.9487                # 충전효율 (RTE 0.90 = ETA_C * ETA_D)
 ETA_D = 0.9487                # 방전효율
 
+# PCS(인버터) 변환효율. 무효전력 공급 시 발생하는 변환손실 계상용(CMD_pcs_loss.md, 2026-07).
+# ★ 유효전력 경로의 PCS 손실은 RTE 0.90(ETA_C*ETA_D, 시스템 레벨 AC-to-AC 효율)에 이미
+# 포함돼 있다 - 이 상수는 benefits.loss_pcs()에서 "무효전력이 유발한 증분 손실"에만 쓰인다
+# (이중계상 방지 - Loss_pcs=(1-ETA_PCS)*[sqrt(P^2+Q^2)-|P|], Q=0이면 정확히 0).
+# 잠정값 0.97 - 통상적 유틸리티급 PCS 효율. 출처 확정 후 값만 교체.
+ETA_PCS = 0.97
+
 SELF_DISCHARGE_DAILY = 0.00067                                     # /day
 SELF_DISCHARGE_HOURLY = 1 - (1 - SELF_DISCHARGE_DAILY) ** (1 / 24)  # 복리 정확값 (=2.7925633002e-05)
 
 V_MIN, V_MAX = 0.95, 1.05    # pu (ANSI C84.1) 전압 제약
+
+# ============================================================
+# 3-1. LinDistFlow 편입 상수 (CLAUDE.md 부록C.4, C.6-3 - 2026-07 편입)
+# ============================================================
+# scripts/test_lindistflow.py 게이트(2026-07-23, 2회 실행)에서 실측 검증된 정식화를
+# 그대로 이식한다(재유도 금지 - C.6-3 명령 0절). V^2 원형, Baran-Wu load-positive
+# 부호규약, Z_BASE_OHM/V_SLACK_SQ 파생식이 그 검증 대상이었다.
+S_BASE_MVA = TARGET_MVA                    # 10.0 MVA (1절 스케일 기준에서 파생, 새 상수 아님)
+Z_BASE_OHM = VN_KV ** 2 / S_BASE_MVA       # = 52.440999... Ohm
+V_SLACK_SQ = SLACK_VM_PU ** 2               # = 1.0404 (V^2 pu 공간의 슬랙 경계값)
+V_SQ_MIN = V_MIN ** 2                       # = 0.9025 (부록C.4-(1) 전압 페널티는 V^2 공간)
+V_SQ_MAX = V_MAX ** 2                       # = 1.1025
+
+# MU_VOLT(전압 유도항 가중치)는 LAMBDA_V/TOTAL_WEEKDAYS_PER_YEAR에서 파생되는데 그 두 상수가
+# 아래(7절/5절)에서야 정의되므로, MU_VOLT 정의 자체는 7절 LAMBDA_V 옆으로 내렸다(순서 의존성).
+
+# PCS 원(circle) 제약의 다각형 내접 근사 변수 개수 (부록C.4-(2)). n=12 -> 최대 반경오차
+# 1-cos(pi/12)=3.4%, 항상 원 안쪽(보수적). QCP(SOCP) 대신 LP 유지가 목적.
+POLY_N = 12
 
 # ============================================================
 # 4. CRF · 비용 · 편익 확정 파라미터 (CLAUDE.md 4절, 부록B)
@@ -175,6 +202,11 @@ PSO_MAIN = dict(n_particles=30, n_iters=100, n_runs=30)   # 본실험: 시나리
 # (CLAUDE.md 7절: "충분히 큰 고정상수로 시작 -> 위반 스케일 관찰 후 조정")
 LAMBDA_V = 1e10       # TODO: 뼈대 실행 후 위반 스케일 관찰해 재조정
 LAMBDA_LINE = 1e10    # TODO: 뼈대 실행 후 위반 스케일 관찰해 재조정
+
+# 하위 LP 전압 유도항 가중치 (부록C.4-(1), C.6-3). LAMBDA_V(원/pu, 연간 ALL_DAYS x 24h x
+# 전버스 합산 스케일)와 MU_VOLT(원/pu, 일간 단일 시나리오 스케일)는 단위가 다르다 - 출발점은
+# 연간->일간 환산인 LAMBDA_V/TOTAL_WEEKDAYS_PER_YEAR. 잠정값, 결과 보고 조정 대상.
+MU_VOLT = LAMBDA_V / TOTAL_WEEKDAYS_PER_YEAR
 
 # 조류계산 발산 시 fitness (evaluate.py). 정상 평가가 도달 가능한 최대 페널티(~1.9e13,
 # 전압붕괴 직전 버스당 ~0.5pu 위반 가정 시 λ_V*위반량 추정치)보다 50배 이상 크게 잡아

@@ -1,0 +1,2 @@
+n_ess,unit_idx,bus,S_rated,E_rated,is_active,eta_peak,duration_h,e_over_s,annual_efc,corr_summer_avg_peak,corr_winter_avg_peak,l1norm_summer,l1norm_winter,dis_peak_hours_summer_avg,dis_peak_hours_summer_peak,dis_peak_hours_winter_avg,dis_peak_hours_winter_peak
+1,0,31,1.0446480415830726,0.4045654533233829,True,0.15239608676181446,0.34854696845003363,0.38727440938892627,277.7666295715211,0.06426345772465424,0.333336069713697,0.09189325486736066,0.10008146780889055,0;16,17;18,10,10

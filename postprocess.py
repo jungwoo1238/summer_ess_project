@@ -1,10 +1,12 @@
 """후처리 지표 계산 (CLAUDE.md 8절, 부록A). runs.csv/generations.csv를 읽어 편익 분해,
 운영·설비 지표, 수렴 진단, b* 분포, 스케줄 유사도 등을 계산·출력한다.
 
-**최적화에 개입하지 않는 사후분석 모듈이다.** PSO·evaluate 경로를 수정하지 않고, 이미
-저장된 로그(runs.csv/generations.csv)와 lower_lp/benefits/evaluate의 기존 함수만 재사용한다.
-evaluate.py/benefits.py/lower_lp.py/pso_core.py/main.py는 전부 미수정 - 필요한 값이 로그에
-없으면 그 사실을 보고할 뿐 main.py를 고치지 않는다(이 게이트의 산출물 그 자체).
+**최적화에 개입하지 않는 사후분석 모듈이다.** PSO·evaluate의 탐색 로직 자체는 건드리지 않고,
+이미 저장된 로그(runs.csv/generations.csv)와 lower_lp/benefits/evaluate의 기존 함수만
+재사용한다(필요한 값이 로그에 없으면 그 사실을 보고할 뿐 main.py를 고치지 않는다 - 이
+게이트의 산출물 그 자체). ★ C.6-3 LinDistFlow 편입으로 lower_lp/evaluate/main의 시그니처
+자체가 바뀌었으므로 이 모듈의 호출부(compute_schedules 등)는 그 새 시그니처에 맞춰
+갱신했다 - "탐색 로직 무수정" 원칙은 유지되며, 바뀐 것은 "재사용하는 API의 모양"뿐이다.
 
 **full 실행 진입 전 게이트다.** dev 결과(n=1, n=2, n=3)로 완주 확인이 끝나야 full로 넘어간다.
 
@@ -168,12 +170,13 @@ def installed_only(units, eps=1e-9):
     return [(b, S, E) for b, S, E in units if S > eps and E > eps]
 
 
-def _expand_to_4n(units):
-    """main.py의 _expand_to_4n과 같은 어댑터 - evaluate.evaluate_particle의 4n 시그니처에 맞춘다."""
-    x4 = np.zeros(4 * len(units), dtype=float)
+def _units_to_x3(units):
+    """[(b,S,E), ...] -> 3n 평탄 배열 (evaluate.evaluate_particle의 현행 3n 시그니처,
+    C.6-3 이후 - main.py의 _expand_to_4n 어댑터는 제거됐다)."""
+    x3 = np.zeros(3 * len(units), dtype=float)
     for i, (b, S, E) in enumerate(units):
-        x4[4 * i:4 * i + 4] = [b, S, E, 0.0]
-    return x4
+        x3[3 * i:3 * i + 3] = [b, S, E]
+    return x3
 
 
 # ============================================================
@@ -408,20 +411,41 @@ def section3_operating_metrics(group, best):
 # ============================================================
 
 def compute_schedules(installed_units):
-    """installed_units: [(b,S,E), ...]. 유닛x시나리오(ALL_DAYS 5개) 조합마다 lower_lp를
-    정확히 1회씩만 호출한다 - 이 결과를 (3)-4 EFC, (8) 유사도, (9) 원자료 CSV가 공유한다
-    (지시사항 "lower_lp 재호출은 1회만 수행"). pandapower는 호출하지 않는다."""
+    """installed_units: [(b,S,E), ...]. ALL_DAYS(5개) 시나리오마다 lower_lp를 정확히
+    1회씩만 호출한다 - 이 결과를 (3)-4 EFC, (8) 유사도, (9) 원자료 CSV가 공유한다
+    (지시사항 "lower_lp 재호출은 1회만 수행"). pandapower는 호출하지 않는다.
+
+    ★ C.6-3 LinDistFlow 편입 이후: 전 기를 **조인트로 한 번에** 넘긴다(기별로 따로 부르지
+    않는다). 이유: LinDistFlow 전압유도항이 기 사이를 결합하므로(lower_lp.py 모듈
+    docstring), 기별로 따로 풀면 실제 PSO 탐색이 evaluate.py에서 찾은 해와 다른(전압유도항이
+    다른 기의 존재를 못 본) 스케줄이 나온다 - 편입 전에는 기별 독립호출이 정확히 같았지만
+    (분리=통합, 2절), 지금은 조인트 호출만이 사후분석의 정합성을 보장한다."""
     base_p_sum = float(evaluate._BASE_P.sum())
-    schedules = {s: [] for s in PM.ALL_DAYS}   # scenario -> [(P_net[T], soc[T+1]) per unit]
-    for b, S, E in installed_units:
-        for s in PM.AVG_DAYS:
-            smp = np.asarray(PM.SMP[s])
-            P_net, soc = lower_lp.solve_avg(S, E, smp, assert_physics=False)
-            schedules[s].append((P_net, soc))
-        for s in PM.PEAK_DAYS:
-            load_mw = base_p_sum * np.asarray(PM.LOAD[s])
-            P_net, soc, _pk = lower_lp.solve_peak(S, E, load_mw, assert_physics=False)
-            schedules[s].append((P_net, soc))
+    # scenario -> [(P_net[T], soc[T+1], Q[T]) per unit]. ★ CMD_diagnose_bloss.md 작업A -
+    # Q도 함께 들고 다닌다(기존엔 버렸음 - 그래서 b_loss 진단이 슬랙 차이로 역추론해야 했다).
+    schedules = {s: [] for s in PM.ALL_DAYS}
+    if not installed_units:
+        return schedules, base_p_sum
+
+    b_arr = np.array([u[0] for u in installed_units], dtype=int)
+    S_arr = np.array([u[1] for u in installed_units], dtype=float)
+    E_arr = np.array([u[2] for u in installed_units], dtype=float)
+    n = len(installed_units)
+
+    for s in PM.AVG_DAYS:
+        smp = np.asarray(PM.SMP[s])
+        profile = np.asarray(PM.LOAD[s])
+        P_net, Q, soc = lower_lp.solve_avg(S_arr, E_arr, b_arr, smp, profile, assert_physics=False)
+        for i in range(n):
+            schedules[s].append((P_net[i], soc[i], Q[i]))
+    for s in PM.PEAK_DAYS:
+        profile = np.asarray(PM.LOAD[s])
+        load_total = base_p_sum * profile
+        P_net, Q, soc, _pk = lower_lp.solve_peak(
+            S_arr, E_arr, b_arr, load_total, profile, assert_physics=False
+        )
+        for i in range(n):
+            schedules[s].append((P_net[i], soc[i], Q[i]))
     return schedules, base_p_sum
 
 
@@ -459,7 +483,7 @@ def section3_4_efc(group, all_units, installed_units, schedules):
         inst_idx += 1
         annual_efc = 0.0
         for s in PM.AVG_DAYS:
-            P_net, _soc = schedules[s][i]
+            P_net, _soc, _q = schedules[s][i]
             annual_efc += PM.N_WEEKDAYS[s] * _efc(P_net, E)
         peak_efc = {s: _efc(schedules[s][i][0], E) for s in PM.PEAK_DAYS}
         worst_case_annual = annual_efc * (365.0 / PM.TOTAL_WEEKDAYS_PER_YEAR)
@@ -907,17 +931,23 @@ def section8_schedule_similarity(group, all_units, installed_units, schedules):
 
 SCHEDULE_FIELDS = [
     'scenario', 't', 'unit', 'b',
-    'p_ch', 'p_dis', 'p_net', 'soc', 'soc_frac',
-    'load_mw', 'smp_won_per_kwh', 'p_slack_base', 'p_slack_ess',
+    'p_ch', 'p_dis', 'p_net', 'q_mvar', 's_apparent', 's_rated', 's_utilization',
+    'poly_margin', 'poly_binding', 'loss_pcs_mw',
+    'soc', 'soc_frac',
+    'load_mw', 'smp_won_per_kwh', 'p_slack_base', 'p_slack_ess', 'p_slack_ess_qzero',
 ]
+
+# 다각형 바인딩 판정 여유(원 제약을 다각형이 근사하는 정도 - CLAUDE.md 부록C.4-(2), POLY_N=12
+# -> 최대 반경오차 1-cos(pi/12)=3.4%). s_utilization이 이 문턱 이상이면 poly_binding=True.
+POLY_BINDING_UTIL_THRESHOLD = 0.99
 
 
 def get_slack_via_evaluate(units_all, n_ess):
     """p_slack_base/p_slack_ess는 조류계산 결과라 lower_lp만으로는 못 얻는다. evaluate.py를
     고치지 않고 evaluate.evaluate_particle(return_detail=True)의 기존 반환값에서 얻을 수
     있는지 확인한다 - 있으면 쓰고, 없으면(예: 발산) 두 컬럼을 생략한다고 보고한다."""
-    x4 = _expand_to_4n(units_all)
-    detail = evaluate.evaluate_particle(x4, return_detail=True)
+    x3 = _units_to_x3(units_all)
+    detail = evaluate.evaluate_particle(x3, return_detail=True)
     if detail.get('diverged'):
         print('  ★ 최적해 재평가가 발산 - p_slack_base/p_slack_ess 확보 불가, 두 컬럼 생략',
               flush=True)
@@ -928,6 +958,46 @@ def get_slack_via_evaluate(units_all, n_ess):
     return evaluate._BASE_FLOW['p_slack'], detail['p_slack_ess']
 
 
+def compute_slack_qzero(installed_units, schedules):
+    """★ CMD_diagnose_bloss.md 작업A 핵심 지표. 같은 (P,Q) 스케줄에서 **Q만 0으로 강제**하고
+    조류계산을 한 번 더 돌려 슬랙을 구한다 - `p_slack_ess_qzero - p_slack_ess`가 Q가 순수하게
+    기여한 손실저감분이다(P 기여와 Q 기여를 원자료 수준에서 분리하는 것이 이 진단의 목적).
+
+    evaluate.py는 수정하지 않는다 - evaluate._NET/_BASE_P/_BASE_Q/_ensure_sgens/
+    _run_pf_with_retry(전부 evaluate.py에 이미 있는 것)를 그대로 재사용한다
+    (get_slack_via_evaluate·scripts/probe_voltage.py와 동일한 재사용 패턴).
+    """
+    evaluate._ensure_worker_state()
+    net = evaluate._NET
+    base_p, base_q = evaluate._BASE_P, evaluate._BASE_Q
+    n = len(installed_units)
+    if n == 0:
+        return {s: np.zeros(PM.TIME_STEPS) for s in PM.ALL_DAYS}
+
+    evaluate._ensure_sgens(net, n)
+    for i, (b, S, E) in enumerate(installed_units):
+        net.sgen.at[i, 'bus'] = int(b)
+
+    slack_qzero = {s: np.zeros(PM.TIME_STEPS) for s in PM.ALL_DAYS}
+    for s in PM.ALL_DAYS:
+        profile = PM.LOAD[s]
+        for t in range(PM.TIME_STEPS):
+            scale = profile[t]
+            net.load['p_mw'] = base_p * scale
+            net.load['q_mvar'] = base_q * scale
+            for i in range(n):
+                P_net, _soc, _q = schedules[s][i]
+                net.sgen.at[i, 'p_mw'] = float(P_net[t])
+                net.sgen.at[i, 'q_mvar'] = 0.0   # ★ Q 강제 0 (P는 실제 해와 동일)
+            ok = evaluate._run_pf_with_retry(net)
+            if not ok:
+                print(f'  ★ Q=0 재조류계산 발산({s}, t={t}) - p_slack_ess_qzero 확보 불가',
+                      flush=True)
+                return None
+            slack_qzero[s][t] = net.res_ext_grid.p_mw.sum()
+    return slack_qzero
+
+
 def validate_schedules(installed_units, schedules):
     print('  검증(저장 전, lower_lp._assert_physics와 별개로 저장 CSV 자체의 일관성 확인):',
           flush=True)
@@ -935,7 +1005,7 @@ def validate_schedules(installed_units, schedules):
     max_ch_dis_product = 0.0
     for s in PM.ALL_DAYS:
         for i, (b, S, E) in enumerate(installed_units):
-            P_net, soc = schedules[s][i]
+            P_net, soc, _q = schedules[s][i]
             if abs(soc[-1] - soc[0]) > SOC_CYCLE_ATOL_MWH:
                 print(f'    * SOC 사이클 등식 위반: {s} unit{i} SOC[0]={soc[0]:.6f} '
                       f'SOC[24]={soc[-1]:.6f}', flush=True)
@@ -959,7 +1029,12 @@ def validate_schedules(installed_units, schedules):
     return dict(ok=(not any_violation), max_ch_dis_product=max_ch_dis_product)
 
 
-def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slack_ess):
+def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slack_ess,
+                         slack_ess_qzero=None):
+    """★ CMD_diagnose_bloss.md 작업A: q_mvar/s_apparent/s_utilization/poly_binding(기별) +
+    p_slack_ess_qzero(시스템 전체, p_slack_base/p_slack_ess와 같은 성격 - 기별이 아니라
+    한 시각당 하나) 열을 추가한다."""
+    poly_cos = float(np.cos(np.pi / PM.POLY_N))
     rows = []
     for s in PM.ALL_DAYS:
         load_mw_s = base_p_sum * np.asarray(PM.LOAD[s])
@@ -967,18 +1042,36 @@ def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slac
         for t in range(PM.TIME_STEPS):
             p_slack_base_t = float(slack_base[s][t]) if slack_base is not None else ''
             p_slack_ess_t = float(slack_ess[s][t]) if slack_ess is not None else ''
+            p_slack_ess_qzero_t = (
+                float(slack_ess_qzero[s][t]) if slack_ess_qzero is not None else ''
+            )
             for i, (b, S, E) in enumerate(installed_units):
-                P_net, soc = schedules[s][i]
+                P_net, soc, Q = schedules[s][i]
                 p_net_t = float(P_net[t])
+                q_t = float(Q[t])
                 p_dis = max(p_net_t, 0.0)
                 p_ch = max(-p_net_t, 0.0)
                 soc_t = float(soc[t])
                 soc_frac = soc_t / E if E > 0 else float('nan')
+
+                s_apparent = float(np.hypot(p_net_t, q_t))
+                s_utilization = s_apparent / S if S > 0 else float('nan')
+                # 다각형(원 근사) 여유 - S*cos(pi/12)가 다각형의 "안쪽 반경"(부록C.4-(2)).
+                poly_margin = S * poly_cos - s_apparent if S > 0 else float('nan')
+                poly_binding = bool(S > 0 and s_utilization >= POLY_BINDING_UTIL_THRESHOLD)
+                # PCS 무효전력 변환손실(CMD_pcs_loss.md) - benefits.loss_pcs와 동일 수식을
+                # 스칼라로 인라인(이미 s_apparent를 구해 둬서 재사용이 더 번거로움). Q=0이면 0.
+                loss_pcs_t = (1.0 - PM.ETA_PCS) * (s_apparent - abs(p_net_t))
+
                 rows.append(dict(
                     scenario=s, t=t, unit=i, b=b,
-                    p_ch=p_ch, p_dis=p_dis, p_net=p_net_t, soc=soc_t, soc_frac=soc_frac,
+                    p_ch=p_ch, p_dis=p_dis, p_net=p_net_t, q_mvar=q_t,
+                    s_apparent=s_apparent, s_rated=S, s_utilization=s_utilization,
+                    poly_margin=poly_margin, poly_binding=poly_binding, loss_pcs_mw=loss_pcs_t,
+                    soc=soc_t, soc_frac=soc_frac,
                     load_mw=float(load_mw_s[t]), smp_won_per_kwh=float(smp_s[t]),
                     p_slack_base=p_slack_base_t, p_slack_ess=p_slack_ess_t,
+                    p_slack_ess_qzero=p_slack_ess_qzero_t,
                 ))
     return rows
 
@@ -1005,6 +1098,28 @@ def section9_schedule_raw(group, best, operating, schedules, base_p_sum, out_dir
     installed = operating['installed']
 
     slack_base, slack_ess = get_slack_via_evaluate(operating['units'], group['n_ess'])
+    slack_ess_qzero = compute_slack_qzero(installed, schedules)
+    if slack_ess_qzero is not None and slack_ess is not None:
+        q_only_mw = sum(float(np.sum(slack_ess_qzero[s] - slack_ess[s])) for s in PM.ALL_DAYS)
+        print(f'  p_slack_ess_qzero 확보 완료 - Q가 순수하게 만든 슬랙 감소(전 시나리오 합) = '
+              f'{q_only_mw:+.4f} MW (양수면 Q가 슬랙을 더 줄임 = 손실저감 기여)', flush=True)
+
+    # ★ CMD_pcs_loss.md 3-(d): PCS 손실 크기를 눈으로 볼 수 있게 연간 합계를 출력.
+    if installed:
+        unit_p_all = {s: np.array([schedules[s][i][0] for i in range(len(installed))]) for s in PM.ALL_DAYS}
+        unit_q_all = {s: np.array([schedules[s][i][2] for i in range(len(installed))]) for s in PM.ALL_DAYS}
+        loss_pcs_all = benefits.loss_pcs(unit_p_all, unit_q_all)
+        print('\n  PCS 무효전력 변환손실(loss_pcs_mw) 일일 합계 - 전 기 합산:', flush=True)
+        annual_avg_mwh = 0.0
+        for s in PM.ALL_DAYS:
+            day_mwh = float(loss_pcs_all[s].sum()) * PM.DT_HOURS
+            tag = f' (N_WD={PM.N_WEEKDAYS[s]})' if s in PM.AVG_DAYS else ' (PEAK - b_defer에 영향)'
+            print(f'    {s:12s}: {day_mwh:.4f} MWh/일{tag}', flush=True)
+            if s in PM.AVG_DAYS:
+                annual_avg_mwh += PM.N_WEEKDAYS[s] * day_mwh
+        print(f'  AVG_DAYS 연간 합계(N_WD 가중, b_loss와 같은 가중치) = {annual_avg_mwh:.2f} MWh/년',
+              flush=True)
+
     validate_schedules(installed, schedules)
     print_wide_schedule(installed, schedules)
 
@@ -1015,7 +1130,8 @@ def section9_schedule_raw(group, best, operating, schedules, base_p_sum, out_dir
             print(f'    {s:12s} unit{i}(b={b}): SOC[0]={soc[0]:.6f} SOC[24]={soc[-1]:.6f} '
                   f'diff={soc[-1] - soc[0]:+.2e}', flush=True)
 
-    rows = build_schedule_rows(installed, schedules, base_p_sum, slack_base, slack_ess)
+    rows = build_schedule_rows(installed, schedules, base_p_sum, slack_base, slack_ess,
+                                slack_ess_qzero)
     path = os.path.join(out_dir, f"schedule_n{group['n_ess']}_{ts}.csv")
     _write_csv(path, SCHEDULE_FIELDS, rows)
     print(f'\n  CSV 저장: {path} ({len(rows)}행)', flush=True)
