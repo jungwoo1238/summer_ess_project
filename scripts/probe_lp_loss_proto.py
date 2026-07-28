@@ -217,6 +217,127 @@ p75/max)도 낸다(B-5 - 중앙값만으로는 편향이 일정한 비율인지 
 `_append_rows`로 즉시 append+flush한다 - 어느 조합에서 `PAD_ABORT_MW` 중단이 나도
 그 이전까지 완료된 조합의 결과는 CSV에 남는다.
 
+## ★★★★★★ 계측 추가 라운드 - 세그먼트 기울기 + 기저 조류 대조 (정식화 불변)
+직전 실행은 네 방식(PWL M=1/2/4, QP)이 모두 완주했고 결과 자체는 유효하다 - 이번 라운드는
+**정식화(SEGMENT_BOUNDARIES, POLY_N 등)를 전혀 바꾸지 않고 계측만 추가**해 두 가지 미해명을
+좁힌다: (1) PWL이 특정 Q에서 정확히 멈추는 현상, (2) QP가 실측 대비 7~9% 과소예측하는
+잔여 오차의 원인. 이 절의 작업들은 **판정하지 않는다** - 원자료를 stdout/CSV로 남기고,
+해석이 필요한 부분(작업 D)은 코드가 아니라 별도 보고 문서로 전달한다(지시 - "코드를 고치지
+마라, 보고만 하라").
+
+### 작업 A: PWL 세그먼트 기울기 실측 노출
+`_lhs_rows_for`가 이미 계산해 LP Parameter로 흘려보내는 세그먼트 시컨트 기울기
+(`_segment_slopes`)를 그 자체로 stdout/CSV에 노출한다 - 지금까지는 LP 안으로 들어가기만
+하고 사람 눈에 보인 적이 없었다. `_pwl_segment_slope_report`가 통제점 x M(1,2,4) x
+세그먼트별로 AVG_DAYS 72개 시각의 기울기 분포(min/p25/median/p75/max)와 기울기<=0인
+(scenario,t) 개수를 낸다. 같은 표에 `_local_slope_near`가 계산하는 "그 구간 중앙값 Q
+근방의 국소 기울기"(Q_BOUNDARY_POINTS 중 그 중앙값을 포함하는 가장 좁은 인접 구간의
+시컨트 - 세그먼트 자신의 시컨트보다 촘촘한 실측값)를 나란히 찍어, 넓은 세그먼트가 실제로
+얼마나 "평평해졌는지"(시컨트가 국소기울기보다 훨씬 작은지)를 사람이 직접 비교할 수 있게
+한다. 시각별 원자료는 별도 CSV(`_lhs` 접미사, `_write_lhs_csv`)로 남긴다 - ts_rows에
+합치면 (point x M x scenario x t x m) 조합으로 행이 폭증하기 때문이다.
+
+### 작업 B: LinDistFlow Qe_base vs AC 실측 조류 대조
+QP의 손실 예측은 `Qe_base = D@(load_q/S_BASE_MVA)`("하류 부하의 합", `_set_params`/
+`_diagnose_q_prediction_gap`이 이미 이 값을 쓴다)를 쓰는데, 실제 선로 조류는 "하류 부하 +
+하류 손실"이다(LinDistFlow가 조류식에서 손실을 무시하므로). `_measure_loss_table`의 기존
+q=0 패스(작업B가 이미 이 지점에서 `v_sq_line_table`을 캡처하고 있었다 - 그 관례를 그대로
+잇는다)에서 **추가 조류계산 없이** `net.res_line`의 `q_from_mvar`/`q_to_mvar`/`p_from_mw`/
+`p_to_mw`/`pl_mw`/`ql_mvar`와 `net.res_bus.vm_pu`(전 버스, 작업C가 함께 씀)를 더 캡처한다
+(`ac_flow_table`, `v_bus_table` - `_measure_loss_table`의 반환값에 추가됨, 기존
+`loss_table`/`v_sq_line_table`의 의미·형태는 손대지 않는다). branch 순서는 기존
+`v_sq_line_table`과 동일하게 `_branch_line_idxs`(정렬 규칙: `sorted(lines.index)`, 기존
+`_branch_from_bus_array`가 내부에서 쓰던 것을 별도 함수로 뽑아 `_branch_to_bus_array`와
+공유한다)를 쓴다. `_print_qe_base_ac_comparison`이 전 (branch,t)와, 통제점별 경로
+(D 행렬로 걸러낸 슬랙->해당 버스 선로만)의 `|q_from|/Qe_base`·`|q_to|/Qe_base` 분포를
+낸다(분모<0.001 Mvar인 선로는 제외하고 제외 건수를 함께 보고). 비를 내기 전에
+`_print_sign_convention_check`가 pandapower `q_from_mvar` 부호규약과 LinDistFlow
+Baran-Wu 부하양수 규약의 대응을 코드 위치를 인용해 확인하고, 실측 부호 불일치 건수를
+직접 세어 보고한다(규약이 맞았다고 주장만 하지 않고 데이터로 확인).
+
+### 작업 C: 손실 공식·전압 규약의 항등성 검증
+직렬 임피던스 가지에서 `loss=r*(P_from^2+Q_from^2)/V_from^2`은 근사가 아니라 항등식이다
+(to단도 마찬가지, 무손실 병렬소자 전제 - 3절 슬랙 수지 검증에서 이미 `net.shunt` 빈
+테이블·`net.line.c_nf_per_km` 전 선로 0 확인됨, build_net.py에도 `net.trafo` 관련 코드가
+없다). `_print_loss_formula_identity_check`가 작업B에서 캡처한 AC 실측값으로 이 항등식이
+재현되는지 확인해, 남은 QP 오차가 "손실공식/전압규약" 탓인지 "Qe_base 자체" 탓인지
+분리한다. 단위계는 물리단위(Ohm·MW·MVAr·kV)를 쓴다 - `r_ohm = r_pu*Z_BASE_OHM`(lower_lp.py
+가 `r_pu`를 만들 때 쓴 나눗셈의 역연산)로 되돌리고, `V=vm_pu*VN_KV`[kV]로 실제 선간전압을
+쓴다. 이 조합(MW/MVAr/kV/Ohm)에서 `Ploss=R*(P^2+Q^2)/V^2`는 3상 등가회로의 표준 관계식이며
+별도 배수가 필요 없다(pandapower 자체가 `res_line`을 이 관례로 계산한다) - pu로도 검산할
+수 있었으나 이미 확립된 물리단위 관례를 그대로 쓰는 쪽이 lower_lp.py의 pu 변환 자체가
+맞는지까지 함께 확인하는 효과가 있어 이쪽을 택했다.
+
+### 작업 D: QP 7~9% 과소예측 원인 조사
+코드를 고치지 않고 가설과 근거만 보고한다(지시 사항) - 결과는 이 파일이 아니라 별도
+보고로 전달된다. 작업 B/C가 그 보고를 뒷받침하는 원자료를 만든다.
+
+### 작업 E: stale 판정 문구 수정 - 코드에 박아 둔 결론은 근거가 바뀌어도 저절로 안 바뀐다
+QP 방식 요약의 "실배포 함의" 문구가 이전 버전의 빌드시간(0.022~0.030초) 전제로 "지배적
+병목이 될 수 있다"는 판정성 결론을 담고 있었는데, 직전 실행 실측(P2 0.0093초/P3 0.0094초,
+P1 0.0646초는 콜드스타트 포함)은 그보다 훨씬 작았고, 버스 정의역이 1~32 32개뿐이라는
+사실(워커당 사전 빌드 캐시 가능)도 그 판정에 반영돼 있지 않았다. `_print_method_summary`의
+QP 분기에서 판정 문장을 지우고 사실(측정된 시간)과 "사용자가 판단하라"는 문구로
+바꿨다 - 이 스크립트 전체가 지키는 "stdout에 판정성 문장을 넣지 않는다" 원칙이 코드
+자체에서 깨졌던 실례이자, 그 원칙이 왜 필요한지를 보여주는 사례라 여기 남겨 둔다.
+
+## ★★★★★★★ 계측 추가 라운드(2차분) - AC 되먹임 규명 + 세그먼트 경계 세분화 + 기준시간 측정
+직전 실행(1차분 계측)에서 확정된 것: (1) 손실공식 항등식이 AC 실측 대비 상대오차
+1e-16~7.5e-12로 사실상 정확하다 - 공식·규약·pu변환은 배제. (2) "Qe_base가 손실을
+제외해 작다"는 가설은 경로 기준 median 1.4~2.2%로 대체로 기각. (3) PWL이 Q=0.05에서
+멈추는 이유가 규명됐다 - 다각형 facet의 한계 PCS비용이 계단함수 C_PCS*sin(2*pi*k/N)이고
+P1 M=4의 [0.05,0.5] 세그먼트 시컨트(0.009559)가 그 첫 계단(0.015, PCS_FACET_THRESHOLD)을
+못 넘어 LP가 채우지 않는다 - PWL의 한계가 아니라 그 구간이 너무 넓다는 **경계 설계**의
+결과다(국소기울기 선형근사로 역산한 진짜 최적점 ~0.125가 QP 실측 최댓값 0.1245와 일치).
+남은 것: QP의 7.8% 과소예측 중 단위수정(+1.8%)·V^2보정(-1.3%)으로 설명되는 부분을 뺀
+약 7%가 미규명 - 유력 후보는 AC 2차 되먹임(Q주입->손실감소->슬랙유입감소->손실이
+loss~(P^2+Q^2)이므로 추가감소, 실측 loss_table은 이를 포함하지만 QP의 단발 선형화는
+못 담는다)이나 확정 자료가 없었다(직전 계측이 전부 Q=0 기저 상태만 잡았기 때문).
+
+### 작업 A(2차분): AC 되먹임 성분 분해
+`_measure_loss_table`의 기존 (bus==ALL_BUSES[0], q==0.0) 전용 캡처와 **별개로**,
+CONTROL_POINT_BUSES(3개, POINTS에서 유도)에 한해 **모든 q 지점**에서 res_line/res_bus를
+읽어 `ac_full_table[bus][scenario]`(shape (T,n_q,n_branch 또는 n_bus))에 담는다(새
+pp.runpp 없음 - 이미 도는 (bus,s,t,qi) 루프의 조건만 넓힌 것). `_decompose_ac_feedback`이
+작업C에서 이미 확인한 loss=r*(P^2+Q^2)/V^2 항등식으로 q=0->q_level 손실 변화를
+A(Q항)+B(P항)+C(V항)으로 정확히 쪼갠다 - 세 항의 합이 실측 총손실차와 일치하는지(항등성,
+구현 검증이지 판정이 아니다)를 먼저 확인하고, 그 다음 A/B/C 각각이 총손실차에서 차지하는
+비율분포(min/p25/median/p75/max)를 낸다. `_qp_predicted_A`가 QP(보정후)의 예측을
+**독립적으로 재구현**해(공유 함수로 리팩터링하지 않음 - A'/A, A'/dLoss_total 비율이
+"두 독립 구현의 일치 여부"를 보는 교차검증이라 하나로 합치면 동어반복이 된다) 기존
+`_diagnose_q_prediction_gap`이 보고하던 비율(0.9276 등)과 이 라운드의 A'/dLoss_total이
+일치하는지도 확인한다. `_print_dqe_ratio`가 (Q_e0-Q_eq)/q(경로 선로만)의 분포를 추가로
+낸다 - Q 주입이 하류 무효손실도 줄이므로 1보다 클 것으로 예상되나 확정은 수치로 한다.
+
+### 작업 B(2차분): 세그먼트 경계 세분화 (기존 M=1/2/4 보존, M=9 추가)
+Q_BOUNDARY_POINTS에 0.075/0.15/0.2를 추가해 8점->11점으로 넓혔다(손실 테이블 실측
+비용 +37%, 32버스x3시나리오x24hx11점=25,344회 조류계산). SEGMENT_BOUNDARIES[9]=
+[0,0.01,0.025,0.05,0.075,0.1,0.15,0.2,0.3,0.5](경계 10개=세그먼트 9개, 전부
+Q_BOUNDARY_POINTS의 부분집합 - 모듈 로드 시 assert로 전 M에 대해 확인)가 [0.05,0.5]
+구간(직전 라운드에서 PWL이 못 채우던 바로 그 구간)을 실측 최적점(~0.125) 근방에서
+세분한다 - "PWL의 한계가 아니라 경계 설계 문제"라는 위 가설을 M=9로 검증한다. 기존
+M=1/2/4·POLY_N=12는 전혀 건드리지 않았다(통제 유지 - 지시서 요구). 실행 순서는
+PWL(M=1->2->4->9)->QP로, `_print_pwl_segment_slopes`가 M=9의 시컨트 기울기 표에
+PCS_FACET_THRESHOLD 값을 나란히 낸다(판정은 하지 않는다 - "넘는다/못 넘는다"는 사람이
+본다). QP는 대조군이므로 이 라운드에서 정식화·순서 어느 쪽도 건드리지 않았다.
+
+### 작업 C(2차분): 기준시간 측정 (같은 하네스로 apples-to-apples)
+기존 solve_time 배율의 기준(REFERENCE_SOLVE_TIME_SEC=0.549초)은 다른 머신·다른 범위
+(evaluate.py 전체: LP 5시나리오+사후 조류계산+편익집계)에서 측정된 값이라 "손실 항 추가로
+얼마나 느려졌는가"의 기준이 될 수 없었다(실제로 "손실 항을 넣었더니 8배 빨라졌다"는
+있을 수 없는 결론이 나왔다). `_build_problem_proto`에 새 method 2개를 추가해 **완전히
+동일한 타이밍 하네스**(`_compute_schedule` - 워밍업 1회+5회 반복, 컴파일 제외, 중앙값)로
+측정한다: `'none'`(기준1, force_q_zero=True 등가 - Q 자체가 cp.Constant(0)이고 다각형/
+s_app/q_penalty를 아예 만들지 않는다. s_app<=S*cos(pi/N)까지 남기면 원 제약이 3.53% 더
+좁아져 "등가"가 깨지므로 폴리곤 자체를 뺐다 - lower_lp.py 원본의 force_q_zero=True 경로가
+"다각형은 걸지 않는다"는 것과 동일한 관례), `'pcs_only'`(기준2, Q는 pwl/qp와 동일하게
+자유·다각형/s_app/q_penalty/SOC/사이클 등식 전부 그대로 - **loss_term만 0**으로 둬 손실
+항의 존재 자체가 만드는 비용을 손실 항 크기와 분리해서 잰다). 두 기준 모두 3개 통제점
+전부에서, 방식 목록(PWL/QP)보다 **먼저** 측정·출력한다. solve_time 옆 배율의 기준을
+기준1로 교체하고 라벨에 명시했다 - REFERENCE_SOLVE_TIME_SEC은 실행 메타에 참고용으로만
+남긴다. 실행 메타에 CPU 모델명(`platform.processor()`)·논리코어수(`os.cpu_count()`)도
+추가해(추가 의존성 없음) 머신 간 비교 근거를 남겼다.
+
 ## 방식 A: PWL (조각선형)
 Q를 M개 구간으로 나누고 구간별 "실측" 기울기(시컨트, 근사·대표값 아님)를 선형 계수로 준다.
 전 32버스 x AVG_DAYS 3개 x 24시간에서 Q_BOUNDARY_POINTS 각 점의 손실을 직접 조류계산으로
@@ -271,6 +392,8 @@ import glob
 import time
 import socket
 import datetime
+import platform   # 계측 추가 라운드 작업C-4: CPU 모델명 - 추가 의존성 없이 얻을 수 있는 범위
+import contextlib   # 작업 지시(9차세션) 작업2: _count_runpp_calls 컨텍스트매니저용
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -314,26 +437,66 @@ ROOT_RESULTS_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), 'results')
 # P3처럼 큰 유닛에서는 배제 못함) "근사오차"가 아니라 "표현 불가"가 섞여 PWL 유효성
 # 판정이 오염된다(세그먼트 합의 상한이 곧 최상단 경계값이라는 구조 - 아래
 # _build_problem_proto의 Q_seg<=delta_m 제약 참조).
-Q_BOUNDARY_POINTS = [0.0, 0.01, 0.025, 0.0375, 0.05, 0.10, 0.30, 0.5]   # Mvar
+Q_BOUNDARY_POINTS = [
+    0.0, 0.01, 0.025, 0.0375, 0.05, 0.0625, 0.075, 0.10, 0.125,
+    0.15, 0.175, 0.2, 0.25, 0.30, 0.4, 0.5,
+]   # Mvar
+# PWL 회귀 통제: 기존 11개 점의 조류계산 순서를 먼저 그대로 보존하고, 신규 M=9 중점은
+# 뒤에서 측정한다. 저장 배열은 Q_BOUNDARY_POINTS의 오름차순 인덱스를 계속 사용한다.
+Q_MEASUREMENT_ORDER = [
+    0.0, 0.01, 0.025, 0.0375, 0.05, 0.075, 0.10, 0.15, 0.2, 0.30, 0.5,
+    0.0625, 0.125, 0.175, 0.25, 0.4,
+]
+assert set(Q_MEASUREMENT_ORDER) == set(Q_BOUNDARY_POINTS)
 # ★ 4차 개정(QP 단위 수정 라운드): 0.0375(0.025~0.05 구간의 중점)를 추가했다 -
 # Q_DIAG_LEVELS의 두 번째 진단점(SEGMENT_BOUNDARIES[4]의 경계 "사이" 지점)을
 # 근사·보간이 아니라 실측으로 대조하기 위함이다(이 스크립트의 다른 모든 "실측"과
 # 동일한 원칙 - 근사식 추정 금지).
+# ★ 계측 추가 라운드(2차분): 0.075/0.15/0.2를 추가했다(8점->11점, 실측 조류계산
+# 비용 +37%) - SEGMENT_BOUNDARIES[9]가 [0.05,0.5] 구간(직전 라운드에서 다각형 한계
+# PCS비용 임계 때문에 PWL이 못 채우던 바로 그 구간, 모듈 docstring "B-3" 참조)을
+# 최적점(QP 실측 ~0.1245) 근방에서 세분하는 데 쓴다.
 
 # M=1: 미세분 없음(2차와 동일하게 기준선으로 유지 - "분할 자체의 효과"를 M=2/4와 대조).
 # M=2: 분할점 하나를 실측 범위(0.02~0.05)의 중앙 근방(0.025)에 둬 최소한의 분할로도
 #   실제 데이터를 가로지르게 한다.
 # M=4: 0~0.05 구간을 셋으로 세분(0.01/0.025/0.05)해 실측 범위 내부의 해상도를 최대로
 #   높이고, 마지막 구간(0.05~0.5)이 꼬리(P3의 큰 개별값)를 담당한다.
+# M=9(계측 추가 라운드 신규): 기존 M=1/2/4는 손대지 않고 추가만 한다(지시서 "통제 유지").
+#   [0.05,0.5] 구간을 다각형 한계비용 임계 근방(0.075/0.1/0.15/0.2/0.3)에서 세분해,
+#   PWL이 그 구간을 세분해도 여전히 임계(PCS_FACET_THRESHOLD, 아래 정의)를 넘는 세그먼트만
+#   골라 채우는지(=한계가 세그먼트 폭이 아니라 다각형 구조 자체에 있다는 가설의 재확인)를
+#   본다 - 모듈 docstring "B-3" 절 참조.
 SEGMENT_BOUNDARIES = {
     1: [0.0, 0.5],
     2: [0.0, 0.025, 0.5],
     4: [0.0, 0.01, 0.025, 0.05, 0.5],
+    9: [0.0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5],
 }
+
+# ★ 계측 추가 라운드 검산(작업B-2): SEGMENT_BOUNDARIES의 모든 경계가 Q_BOUNDARY_POINTS의
+# 부분집합이어야 텔레스코핑 항등식(_segment_slopes가 그 점들에서 실측된 손실만으로 시컨트를
+# 만드는 전제)이 성립한다 - 모듈 로드 시 1회, 전 M에 대해 확인한다.
+for _M_check, _boundaries_check in SEGMENT_BOUNDARIES.items():
+    assert set(_boundaries_check).issubset(set(Q_BOUNDARY_POINTS)), (
+        f"SEGMENT_BOUNDARIES[{_M_check}]={_boundaries_check}가 Q_BOUNDARY_POINTS"
+        f"({Q_BOUNDARY_POINTS})의 부분집합이 아니다 - 텔레스코핑 항등식이 깨진다."
+    )
+del _M_check, _boundaries_check
 
 ALL_BUSES = list(range(PM.B_BOUNDS[0], PM.B_BOUNDS[1] + 1))   # 1..32
 
 C_PCS = 1.0 - PM.ETA_PCS   # benefits.loss_pcs와 동일 물리상수 재사용(새로 만들지 않음)
+
+# ★ 계측 추가 라운드(작업B-3/B-4) - 다각형 facet k의 한계 PCS 비용은 ds_app/dQ=sin(theta_k)
+# (theta_k=2*pi*k/POLY_N)에 비례한다. 가장 작은 양의 계단(k=1)이 PWL 세그먼트가 넘어야
+# 하는 실질적 임계다(직전 실행에서 규명됨 - 모듈 docstring "B-3" 참조). 판정에 쓰지 않고
+# 세그먼트 기울기 표에 값만 나란히 출력한다(지시서: "임계값 자체도 상수로 출력하라... 판정은
+# 하지 마라").
+PCS_FACET_THRESHOLD = C_PCS * np.sin(2.0 * np.pi / PM.POLY_N)
+
+CONTROL_POINT_BUSES = [int(p['b']) for p in POINTS]   # 계측 추가 라운드 작업A-1 - 3개 통제점의
+                                                         # 버스(POINTS에서 유도, 하드코딩 안 함)
 
 # ★ 4차 개정(QP 단위 수정 라운드) 검산 2-1: POLY_N 짝수 검사 (모듈 로드 시 1회).
 # 근거: q_penalty>=s_app-P_ch-P_dis가 Q=0에서 정확히 0이 되려면(회귀 앵커, 검산 2-3)
@@ -346,10 +509,19 @@ assert PM.POLY_N % 2 == 0, (
     "없어 충전(P_net<0) 시각의 Q=0 회귀 앵커(q_penalty=0)가 구조적으로 깨진다."
 )
 
-# 사용자 제공 참조값(이 세션에서 독립 검증하지 않음).
+# ★ 계측 추가 라운드 작업C-1/C-3: 이 상수는 더 이상 solve_time 배율의 기준으로 쓰지
+# 않는다. (i) evaluate.py 전체(LP 5시나리오+사후 조류계산+편익집계)를 잰 것이고
+# (ii) 다른 머신에서 측정됐으며 (iii) 이 스크립트의 solve_avg 3시나리오와 범위가 달라
+# "손실 항 추가로 몇 배 느려졌는가"의 기준이 될 수 없다(실제로 이 기준으로는 "손실 항을
+# 넣었더니 빨라졌다"는 있을 수 없는 결론이 나왔다). **다른 머신·다른 범위의 참고값으로만**
+# 남겨 두고(실행 메타에서 1회 출력), 배율은 아래 기준1(force_q_zero=True 등가, 같은
+# 스크립트·같은 통제점·같은 타이밍 하네스로 실측)로 교체했다 - _print_method_summary 참조.
 REFERENCE_SOLVE_TIME_SEC = 0.549
 
-METHODS = [('pwl', 1), ('pwl', 2), ('pwl', 4), ('qp', None)]
+# ★ 계측 추가 라운드 작업B-2: 기존 M=1/2/4는 그대로 두고 실행 순서 끝에 M=9를 추가한다
+# (지시서: "PWL M=1 -> M=2 -> M=4 -> M=9 -> QP"). QP는 대조군이므로 이 라운드에서
+# 일절 건드리지 않는다(정식화·순서상 위치 모두 - 통제 유지).
+METHODS = [('pwl', 1), ('pwl', 2), ('pwl', 4), ('pwl', 9), ('qp', None)]
 
 TS_CSV_FIELDS = ['method', 'M', 'point_id', 'scenario', 't', 'q_lp', 'q_star', 'abs_err',
                   'rel_err', 'inaccurate',
@@ -364,18 +536,27 @@ TS_CSV_FIELDS = ['method', 'M', 'point_id', 'scenario', 't', 'q_lp', 'q_star', '
                   'max_pad_mw', 'max_pad_scenario', 'max_pad_t', 'max_pad_unit',
                   'max_pad_annual_won_implied',
                   # ★ 작업 B(QP V^2 보정) - 이 실행에서 실제 최적화 경로가 보정을 썼는지.
-                  'qp_v2_correction']
+                  'qp_v2_correction',
+                  # ★ 계측·진단 라운드 작업 1: 기존 열은 그대로 두고 뒤에만 추가한다.
+                  # 모두 워밍업 solve의 확정값이며 타이밍 반복 solve 값은 사용하지 않는다.
+                  'p_ch', 'p_dis', 'p_net', 's_app', 'q_penalty',
+                  'pcs_true', 'pcs_charged']
 
 # ★ 4차 개정 신규 상수
 PCS_CIRCLE_TOL = 1e-9        # sqrt(P^2+Q^2)<=S*(1+tol) 판정 여유(부동소수점, 지시서 검산)
 N_TIMING_REPS = 5            # 워밍업 이후 반복 측정 횟수(지시서 "속도 측정 설계 수정")
 
 # ★ 4차 개정(QP 단위 수정 라운드) 신규 상수
-# Q_DIAG_LEVELS: 0.05(SEGMENT_BOUNDARIES[4] 경계 - PWL 예측이 텔레스코핑 항등식으로
-# 실측과 정확히 같아지는 지점) + 0.0375(경계 "사이" - PWL의 세그먼트 내 선형보간
-# 오차가 실제로 드러나는 지점). 0.05 하나만 재면 PWL에게 구조적으로 유리한 지점만
-# 보는 것이라 비교가 한쪽으로 기운다(지시서 근거).
-Q_DIAG_LEVELS = [0.05, 0.0375]
+# ★ 계측·진단 라운드 작업 2: 직전 운전점의 Q 범위 전체에서 alpha=A/dLoss를 잰다.
+# 전부 기존 Q_BOUNDARY_POINTS에 이미 있는 실측점이어야 하며, 아래 assert가 이를 강제한다.
+Q_DIAG_LEVELS = [
+    0.0375, 0.05, 0.0625, 0.075, 0.1, 0.125,
+    0.15, 0.175, 0.2, 0.25, 0.3, 0.4,
+]
+assert set(Q_DIAG_LEVELS).issubset(set(Q_BOUNDARY_POINTS)), (
+    f"Q_DIAG_LEVELS={Q_DIAG_LEVELS} 중 Q_BOUNDARY_POINTS={Q_BOUNDARY_POINTS}에 없는 값이 "
+    "있다. 진단점을 추가 조류계산으로 보충하지 말고 기존 실측점만 사용해야 한다."
+)
 Q_ZERO_ANCHOR_TOL = 1e-9         # q_penalty==0(Q=0 고정 시) 판정 여유(지시서 2-3)
 
 # ★ 4차 개정 확장 라운드(검산 2-2 재설계) - 지시서 작업 A.
@@ -402,6 +583,15 @@ PAD_ABORT_MW = 1e-4                # ~2,080원/년 - 넘으면 즉시 AssertionE
 # _diagnose_q_prediction_gap(진단 전용)은 이 값과 무관하게 항상 양쪽을 다 계산해 보고한다.
 QP_V2_CORRECTION = True
 
+# ★ QP 보정 적용 라운드: 두 플래그는 QP 최적화 경로에만 적용한다. PWL/기준 경로는
+# `_set_params`의 method 분기상 이 값을 읽지 않는다. 진단 함수는 네 변형을 계속 모두 계산한다.
+QP_QE_BASE_AC = True
+QP_GROSSUP = True
+# 2026-07-28 직전 실행(probe_lp_loss_proto_PSL_20260728_110753)의 p=0 실측 alpha.
+# 통제점별 원값: P1=0.9526, P2=0.9524, P3=0.9555. 아래 값은 세 원값의 median이며,
+# 실측 alpha이지 튜닝 파라미터가 아니다. 실행 중 재측정값과의 차이는 stdout/report에 낸다.
+QP_GROSSUP_ALPHA = 0.9526
+
 # ★ 작업 C(무료구간 계측 필터 수정) 신규 상수. 기존 in_zone 조건(arr>0.0)은 부동소수점
 # 잡음(예: 1e-12처럼 수치적으로는 0인데 엄밀히는 양수인 값)까지 "비영"으로 세어 P1에서
 # 71/72라는 사실상 전체를 무료구간으로 오판했다. _group_stats가 이미 쓰는 것과 동일한
@@ -413,19 +603,59 @@ FREE_ZONE_NONZERO_TOL = 1e-6
 # 1) 손실 테이블 실측 (probe_q_residual.py 방식의 전 버스 확장, AVG_DAYS 한정)
 # ============================================================
 
-def _branch_from_bus_array(net):
-    """lower_lp._build_topology()와 정확히 동일한 branch 정렬 규칙(sorted(lines.index))
-    으로 각 branch의 from_bus를 뽑는다 - r_pu/D와 같은 branch 순서를 보장하기 위해
-    그 정렬 규칙을 그대로 재현했다(lower_lp.py 원본은 건드리지 않는다 - net.line만
-    읽기 전용으로 읽는다). 작업 B(V^2 보정)의 "송단(from bus) 전압" 규약에 쓰인다."""
+def _branch_line_idxs(net):
+    """lower_lp._build_topology()와 정확히 동일한 branch 정렬 규칙(sorted(lines.index))을
+    재현한 pandapower 원본 line 인덱스 리스트(압축 안 함) - r_pu/D/from_bus_arr와 같은
+    branch 순서를 보장하기 위해 이 정렬을 모든 branch-indexed 테이블이 공유한다."""
     lines = net.line[net.line['in_service']]
-    line_idxs = sorted(lines.index)
+    return sorted(lines.index)
+
+
+def _branch_from_bus_array(net):
+    """각 branch(=_branch_line_idxs 순서)의 from_bus. 작업 B(V^2 보정)의 "송단(from bus)
+    전압" 규약에 쓰인다(lower_lp.py 원본은 건드리지 않는다 - net.line만 읽기 전용으로 읽음)."""
+    line_idxs = _branch_line_idxs(net)
     return np.array([int(net.line.at[idx, 'from_bus']) for idx in line_idxs])
+
+
+def _branch_to_bus_array(net):
+    """각 branch(=_branch_line_idxs 순서)의 to_bus - 작업C(손실공식 항등성 검증)의
+    "수단(to bus)" 전압에 쓰인다."""
+    line_idxs = _branch_line_idxs(net)
+    return np.array([int(net.line.at[idx, 'to_bus']) for idx in line_idxs])
+
+
+@contextlib.contextmanager
+def _count_runpp_calls():
+    """작업 지시(9차세션) 작업2: pp.runpp 실제 호출 횟수를 호출 지점에서 직접 센다
+    (루프 크기 x 경계점 수 등으로 역산하지 않는다 - _measure_loss_table의 조류계산은
+    evaluate._run_pf_with_retry를 거치는데, 그 함수는 1차(init='results')가 실패하면
+    2차(init='flat')로 재시도한다(evaluate.py:77-91) - 즉 루프 1회당 runpp 호출이
+    1회가 아니라 최대 2회일 수 있어 루프 크기로부터의 역산은 부정확할 수 있다.
+
+    evaluate.py는 `import pandapower as pp`로 pp.runpp를 매 호출 시점에 속성조회하므로,
+    여기서 전역 pandapower 모듈의 runpp 속성 자체를 계측 래퍼로 바꿔치기하면 evaluate.py
+    안에서(파일 자체는 수정하지 않고) 일어나는 호출까지 같은 모듈 객체를 통해 셀 수 있다.
+    래퍼는 원본 pp.runpp를 인자 그대로 호출·반환할 뿐이므로 조류계산의 동작·결과·연산
+    순서에는 영향이 없다(카운터 증분만 추가) - with 블록을 벗어나면(정상/예외 무관) 원본으로
+    복원한다."""
+    counter = {'n': 0}
+    original_runpp = pp.runpp
+
+    def _wrapped_runpp(*args, **kwargs):
+        counter['n'] += 1
+        return original_runpp(*args, **kwargs)
+
+    pp.runpp = _wrapped_runpp
+    try:
+        yield counter
+    finally:
+        pp.runpp = original_runpp
 
 
 def _measure_loss_table(net, base_p, base_q):
     """AVG_DAYS x 24h x 전 32버스 x Q_BOUNDARY_POINTS에서 Loss_line(P_inj=0,Q_inj=q)를
-    실측한다. 반환: (loss_table, v_sq_line_table).
+    실측한다. 반환: (loss_table, v_sq_line_table, ac_flow_table, v_bus_table).
     loss_table[bus][scenario] = ndarray shape (24, len(Q_BOUNDARY_POINTS)).
     P_inj=0 고정 - "Q 단독의 손실저감 효과"를 재는 것이 이 실험의 정의이기 때문이다.
     ★ 3차 개정: PEAK_DAYS 실측을 뺐다(solve_peak 프로토타입 자체가 사라졌으므로 그
@@ -436,14 +666,54 @@ def _measure_loss_table(net, base_p, base_q):
     이 sgen은 완전한 no-op - 어느 버스에 달려 있든 결과에 영향이 없다) 패스를 그
     "기저 조류계산"으로 재사용해 캡처한다 - **추가 조류계산을 전혀 돌리지 않는다**
     (지시서 요구사항). 이 값은 (scenario,t)에만 의존하고 bus 루프와 무관하므로 첫
-    버스에서 한 번만 캡처하면 전 버스가 공유해도 정확하다."""
+    버스에서 한 번만 캡처하면 전 버스가 공유해도 정확하다.
+
+    ★ 계측 추가 라운드(작업 A/B/C) 신규 - 기존 v_sq_line_table 캡처와 **정확히 같은
+    호출(같은 if 블록 안)**에서 추가로 읽는다(추가 pp.runpp 없음):
+      ac_flow_table[scenario] = dict(q_from,q_to,p_from,p_to,pl,ql) 각 ndarray(n_branch,T) -
+        작업B(Qe_base vs AC 실측 대조)·작업C(손실공식 항등성 검증)가 함께 쓴다.
+      v_bus_table[scenario] = ndarray(n_bus,T) - 전 버스 vm_pu(제곱 안 함, raw) - 작업C가
+        to_bus 전압을 뽑는 데 쓴다(기존 v_sq_line_table은 from_bus만 이미 제곱해 저장하므로
+        재사용하지 않고 별도로 둔다 - 기존 테이블의 형태·의미는 손대지 않는다는 원칙).
+
+    ★ 계측 추가 라운드(작업A-1) 신규 - ac_full_table[bus][scenario] = dict(p_from,q_from,
+    p_to,q_to,pl,vm_bus) 각 ndarray(T,len(Q_BOUNDARY_POINTS),n_branch 또는 n_bus) -
+    CONTROL_POINT_BUSES(3개)에 한해 **모든 q 지점**에서 캡처한다(위 v_sq_line_table 등은
+    bus==ALL_BUSES[0]의 q==0.0 지점 1개뿐이라 별개 - 이 테이블은 그 제약을 없앤 것).
+    같은 t,qi 축을 공유하므로 "q=0 상태"와 "q=q_level 상태"가 같은 (scenario,t)에서
+    왔음이 인덱싱 자체로 보장된다(별도 시각 매칭 로직 불필요 - 작업A-2 참조). 새 pp.runpp를
+    추가하지 않는다 - 이미 도는 (bus,s,t,qi) 루프에서 조건만 넓힌다(bus==ALL_BUSES[0] and
+    q==0.0 한 지점 -> bus in CONTROL_POINT_BUSES인 전 q 지점)."""
     if len(net.sgen) == 0:
         pp.create_sgen(net, bus=ALL_BUSES[0], p_mw=0.0, q_mvar=0.0, name='probe_lp_loss_proto')
     sgen_idx = net.sgen.index[0]
 
+    line_idxs = _branch_line_idxs(net)
     from_bus_arr = _branch_from_bus_array(net)
     n_branch = len(from_bus_arr)
+    n_bus = len(net.bus)
+    n_q = len(Q_BOUNDARY_POINTS)
     v_sq_line_table = {s: np.zeros((n_branch, PM.TIME_STEPS)) for s in PM.AVG_DAYS}
+    v_bus_table = {s: np.zeros((n_bus, PM.TIME_STEPS)) for s in PM.AVG_DAYS}
+    ac_flow_table = {
+        s: dict(
+            q_from=np.zeros((n_branch, PM.TIME_STEPS)), q_to=np.zeros((n_branch, PM.TIME_STEPS)),
+            p_from=np.zeros((n_branch, PM.TIME_STEPS)), p_to=np.zeros((n_branch, PM.TIME_STEPS)),
+            pl=np.zeros((n_branch, PM.TIME_STEPS)), ql=np.zeros((n_branch, PM.TIME_STEPS)),
+        ) for s in PM.AVG_DAYS
+    }
+    ac_full_table = {
+        bus: {
+            s: dict(
+                p_from=np.zeros((PM.TIME_STEPS, n_q, n_branch)),
+                q_from=np.zeros((PM.TIME_STEPS, n_q, n_branch)),
+                p_to=np.zeros((PM.TIME_STEPS, n_q, n_branch)),
+                q_to=np.zeros((PM.TIME_STEPS, n_q, n_branch)),
+                pl=np.zeros((PM.TIME_STEPS, n_q, n_branch)),
+                vm_bus=np.zeros((PM.TIME_STEPS, n_q, n_bus)),
+            ) for s in PM.AVG_DAYS
+        } for bus in CONTROL_POINT_BUSES
+    }
 
     loss_table = {}
     n_total = len(ALL_BUSES) * len(PM.AVG_DAYS)
@@ -457,7 +727,8 @@ def _measure_loss_table(net, base_p, base_q):
                 scale = profile[t]
                 net.load['p_mw'] = base_p * scale
                 net.load['q_mvar'] = base_q * scale
-                for qi, q in enumerate(Q_BOUNDARY_POINTS):
+                for q in Q_MEASUREMENT_ORDER:
+                    qi = Q_BOUNDARY_POINTS.index(q)
                     net.sgen.at[sgen_idx, 'bus'] = bus
                     net.sgen.at[sgen_idx, 'p_mw'] = 0.0
                     net.sgen.at[sgen_idx, 'q_mvar'] = q
@@ -468,14 +739,29 @@ def _measure_loss_table(net, base_p, base_q):
                         )
                     arr[t, qi] = float(net.res_line.pl_mw.sum())
                     if bus == ALL_BUSES[0] and q == 0.0:
-                        v_bus_sq = (net.res_bus.vm_pu.to_numpy()) ** 2
-                        v_sq_line_table[s][:, t] = v_bus_sq[from_bus_arr]
+                        v_bus_all = net.res_bus.vm_pu.to_numpy()
+                        v_sq_line_table[s][:, t] = (v_bus_all ** 2)[from_bus_arr]
+                        v_bus_table[s][:, t] = v_bus_all
+                        ac_flow_table[s]['q_from'][:, t] = net.res_line.loc[line_idxs, 'q_from_mvar'].to_numpy()
+                        ac_flow_table[s]['q_to'][:, t] = net.res_line.loc[line_idxs, 'q_to_mvar'].to_numpy()
+                        ac_flow_table[s]['p_from'][:, t] = net.res_line.loc[line_idxs, 'p_from_mw'].to_numpy()
+                        ac_flow_table[s]['p_to'][:, t] = net.res_line.loc[line_idxs, 'p_to_mw'].to_numpy()
+                        ac_flow_table[s]['pl'][:, t] = net.res_line.loc[line_idxs, 'pl_mw'].to_numpy()
+                        ac_flow_table[s]['ql'][:, t] = net.res_line.loc[line_idxs, 'ql_mvar'].to_numpy()
+                    if bus in CONTROL_POINT_BUSES:
+                        tbl = ac_full_table[bus][s]
+                        tbl['vm_bus'][t, qi, :] = net.res_bus.vm_pu.to_numpy()
+                        tbl['p_from'][t, qi, :] = net.res_line.loc[line_idxs, 'p_from_mw'].to_numpy()
+                        tbl['q_from'][t, qi, :] = net.res_line.loc[line_idxs, 'q_from_mvar'].to_numpy()
+                        tbl['p_to'][t, qi, :] = net.res_line.loc[line_idxs, 'p_to_mw'].to_numpy()
+                        tbl['q_to'][t, qi, :] = net.res_line.loc[line_idxs, 'q_to_mvar'].to_numpy()
+                        tbl['pl'][t, qi, :] = net.res_line.loc[line_idxs, 'pl_mw'].to_numpy()
             loss_table[bus][s] = arr
             done += 1
             if done % 20 == 0 or done == n_total:
                 print(f'  손실 테이블 실측 진행: {done}/{n_total} (bus={bus}, scenario={s})',
                       flush=True)
-    return loss_table, v_sq_line_table
+    return loss_table, v_sq_line_table, ac_flow_table, v_bus_table, ac_full_table
 
 
 def _segment_slopes(arr_row, boundaries):
@@ -524,13 +810,14 @@ def _check_pwl_slope_monotonicity(loss_table, bus, scenario, M):
 
 
 def _print_pwl_monotonicity_check(loss_table):
-    """M=2/4에 대해 전 통제점 x AVG_DAYS를 훑어 비단조 구간을 보고한다(M=1은 세그먼트가
-    1개뿐이라 단조성 정의 자체가 없음). 경고만 출력 - 중단하지 않는다(지시서 2-4)."""
+    """M=2/4/9에 대해 전 통제점 x AVG_DAYS를 훑어 비단조 구간을 보고한다(M=1은 세그먼트가
+    1개뿐이라 단조성 정의 자체가 없음). 경고만 출력 - 중단하지 않는다(지시서 2-4).
+    ★ 계측 추가 라운드: M=9 추가(기존 M=2/4는 그대로)."""
     section('PWL 세그먼트 기울기 단조성 점검 (경고만 - 위반해도 중단하지 않음)')
     total_violations = 0
     for point in POINTS:
         bus = point['b']
-        for M in (2, 4):
+        for M in (2, 4, 9):
             for s in PM.AVG_DAYS:
                 violations = _check_pwl_slope_monotonicity(loss_table, bus, s, M)
                 total_violations += len(violations)
@@ -547,6 +834,652 @@ def _print_pwl_monotonicity_check(loss_table):
 
 
 # ============================================================
+# 1-A) 계측 추가 라운드 - 작업 A: PWL 세그먼트 기울기 실측 노출
+# ============================================================
+
+def _local_slope_near(loss_row, q_mid):
+    """Q_BOUNDARY_POINTS 중 q_mid를 포함하는 가장 좁은 인접 구간의 실측 시컨트 기울기를
+    낸다("그 구간 중앙값에서의 국소 기울기" - 지시서 A-3). 세그먼트 경계 자체가
+    Q_BOUNDARY_POINTS의 원소이므로, 넓은 세그먼트(예: M=1의 [0,0.5])의 중앙값(0.25)은
+    더 촘촘한 두 경계점([0.10,0.30]) 사이에 들어가 세그먼트 자신의 시컨트보다 해상도가
+    높은 참고값이 나온다. q_mid가 Q_BOUNDARY_POINTS의 원소와 정확히 같으면(예: M=4의
+    [0.025,0.05] 세그먼트 중앙값 0.0375는 그 자체가 실측점이다) 그 값을 포함하는 첫
+    구간([0.025,0.0375])을 쓴다 - 세그먼트의 앞쪽 절반만큼의 더 촘촘한 해상도가 된다.
+    반환: (slope, bracket_lo, bracket_hi) 또는 (None,None,None)(범위 밖일 때)."""
+    pts = Q_BOUNDARY_POINTS
+    idx = {q: i for i, q in enumerate(pts)}
+    for i in range(len(pts) - 1):
+        lo, hi = pts[i], pts[i + 1]
+        if lo <= q_mid <= hi:
+            slope = float((loss_row[idx[lo]] - loss_row[idx[hi]]) / (hi - lo))
+            return slope, lo, hi
+    return None, None, None
+
+
+def _pwl_segment_slope_report(loss_table, bus, M):
+    """M의 각 세그먼트에 대해 AVG_DAYS 72개 시각의 실측 시컨트 기울기 분포(min/p25/
+    median/p75/max, MW/Mvar)와 기울기<=0인 (scenario,t) 개수, 그리고 그 구간 중앙값
+    근방의 국소 기울기 분포(_local_slope_near)를 계산한다. 판정하지 않는다 - 수치만."""
+    boundaries = SEGMENT_BOUNDARIES[M]
+    n_seg = len(boundaries) - 1
+    rows = []
+    for m in range(n_seg):
+        lo, hi = boundaries[m], boundaries[m + 1]
+        q_mid = (lo + hi) / 2.0
+        seg_vals, local_vals = [], []
+        local_bracket = None
+        for s in PM.AVG_DAYS:
+            arr = loss_table[bus][s]
+            for t in range(PM.TIME_STEPS):
+                slopes = _segment_slopes(arr[t], boundaries)
+                seg_vals.append(slopes[m])
+                local_slope, l_lo, l_hi = _local_slope_near(arr[t], q_mid)
+                if local_slope is not None:
+                    local_vals.append(local_slope)
+                    local_bracket = (l_lo, l_hi)
+        seg_arr = np.array(seg_vals)
+        pct = np.percentile(seg_arr, [0, 25, 50, 75, 100])
+        n_nonpositive = int(np.sum(seg_arr <= 0.0))
+        local_pct = (np.percentile(np.array(local_vals), [0, 25, 50, 75, 100])
+                     if local_vals else None)
+        rows.append(dict(m=m, boundary_lo=lo, boundary_hi=hi, delta_m=hi - lo,
+                          slope_pct=pct, n_nonpositive=n_nonpositive,
+                          local_bracket=local_bracket, local_pct=local_pct))
+    return rows
+
+
+def _print_pwl_segment_slopes(loss_table):
+    """지시서 작업A-1: 통제점별 M=1/2/4/9를 나란히 출력한다. 판정 없음 - 수치만.
+    ★ 계측 추가 라운드 작업B-4: 다각형 facet 한계비용 임계(PCS_FACET_THRESHOLD)를 값만
+    함께 출력한다 - "넘는다/못 넘는다" 판정은 하지 않는다(지시서 요구)."""
+    section('작업A: PWL 세그먼트 기울기 실측 분포 (판정 없음 - 수치와 위치만)')
+    print(f"  참고: 다각형 facet 한계 PCS비용 임계 PCS_FACET_THRESHOLD = "
+          f"C_PCS*sin(2*pi/POLY_N) = {PCS_FACET_THRESHOLD:.6f} - 아래 시컨트 기울기(MW/Mvar)"
+          f"와 같은 단위계에서 직접 비교 가능하다(SMP*dt가 편익·비용 양쪽에 동일하게 곱해져"
+          f" 부등식에서 상쇄되므로 - 배경 절 참조). 판정 아님, 값만 나란히 볼 것.", flush=True)
+    for point in POINTS:
+        bus = point['b']
+        print(f"\n  {point['point_id']} (bus={bus}):", flush=True)
+        for M in (1, 2, 4, 9):
+            print(f"    M={M} (경계={SEGMENT_BOUNDARIES[M]}):", flush=True)
+            for r in _pwl_segment_slope_report(loss_table, bus, M):
+                pct = r['slope_pct']
+                print(f"      m={r['m']} 구간=[{r['boundary_lo']},{r['boundary_hi']}] "
+                      f"delta={r['delta_m']:.4f}: 시컨트기울기(MW/Mvar) "
+                      f"min={pct[0]:.6f} p25={pct[1]:.6f} median={pct[2]:.6f} "
+                      f"p75={pct[3]:.6f} max={pct[4]:.6f}  기울기<=0인 (s,t) 개수="
+                      f"{r['n_nonpositive']}/72", flush=True)
+                if r['local_pct'] is not None:
+                    lb = r['local_bracket']
+                    lp = r['local_pct']
+                    q_mid = (r['boundary_lo'] + r['boundary_hi']) / 2.0
+                    print(f"        (참고) 중앙값 Q={q_mid:.4f} 근방 국소기울기"
+                          f"[{lb[0]},{lb[1]}]: min={lp[0]:.6f} p25={lp[1]:.6f} "
+                          f"median={lp[2]:.6f} p75={lp[3]:.6f} max={lp[4]:.6f}", flush=True)
+
+
+LHS_CSV_FIELDS = ['point_id', 'M', 'scenario', 't', 'm', 'boundary_lo', 'boundary_hi',
+                   'delta_m', 'slope']
+
+
+def _make_lhs_path():
+    """지시서 작업A-2: 파일명 접미사 _lhs (probe_lp_loss_proto.py 본 CSV와 같은 호스트/
+    타임스탬프 규약, scripts/results 관례)."""
+    hostname = socket.gethostname()
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return os.path.join(RESULTS_DIR, f'probe_lp_loss_proto_lhs_{hostname}_{ts}.csv')
+
+
+def _write_lhs_csv(path, loss_table):
+    """지시서 작업A-2: 세그먼트 기울기는 시각별 값이라 ts_rows에 넣으면 행이 폭증하므로
+    (point_id x M x scenario x t x m) 별도 CSV에 남긴다."""
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    rows = []
+    for point in POINTS:
+        bus = point['b']
+        for M in (1, 2, 4, 9):
+            boundaries = SEGMENT_BOUNDARIES[M]
+            for s in PM.AVG_DAYS:
+                arr = loss_table[bus][s]
+                for t in range(PM.TIME_STEPS):
+                    slopes = _segment_slopes(arr[t], boundaries)
+                    for m, slope in enumerate(slopes):
+                        rows.append(dict(
+                            point_id=point['point_id'], M=M, scenario=s, t=t, m=m,
+                            boundary_lo=boundaries[m], boundary_hi=boundaries[m + 1],
+                            delta_m=boundaries[m + 1] - boundaries[m], slope=slope,
+                        ))
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=LHS_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
+    print(f'세그먼트 기울기 CSV 저장(작업A-2): {path} ({len(rows)}행)', flush=True)
+
+
+# ============================================================
+# 1-B) 계측 추가 라운드 - 작업 B: LinDistFlow Qe_base vs AC 실측 조류 대조
+# ============================================================
+
+def _compute_qe_base_mvar(topo, profile):
+    """Qe_base[branch,t] = D@(하류 부하 무효전력 합)/S_BASE_MVA, 물리단위(Mvar)로 환산해
+    반환한다 - _diagnose_q_prediction_gap이 이미 쓰는 것과 동일한 산식이다(그 함수의
+    기존 지역 계산은 건드리지 않았다 - "정식화는 그대로, 계측만 추가" 원칙에 따라 이
+    함수는 작업B 전용으로 별도로 새로 정의했을 뿐 리팩터링이 아니다)."""
+    D = topo['D']
+    _, base_load_q_bus = lower_lp.base_load_bus_arrays()
+    load_q_val = base_load_q_bus[:, None] * np.asarray(profile, dtype=float)[None, :]
+    Qe_base_pu = D @ (load_q_val / PM.S_BASE_MVA)
+    return Qe_base_pu * PM.S_BASE_MVA
+
+
+def _path_branches_for_bus(D, bus):
+    """D[e,bus]==1인 branch 집합 = 슬랙~bus 경로(lower_lp.py의 D 행렬 정의 - "bus가 branch
+    e의 하류(자손)"). probe_q_marginal.py의 path(i) 정의와 동일하다."""
+    return np.where(D[:, bus] == 1)[0]
+
+
+def _print_sign_convention_check(ac_flow_table, topo):
+    """지시서 작업B-4: 비를 내기 전에 부호 규약을 코드로 확인한다(단정하지 않고 실측
+    데이터로 검증).
+
+    관찰(코드 인용):
+    - lower_lp.py `_build_topology`(children[i].append((j,idx)) for i=from_bus,j=to_bus)는
+      from_bus를 항상 상류(슬랙에 가까운 쪽)로 간주해 트리를 구성한다 - 이 스크립트의
+      `_branch_from_bus_array`/`_branch_to_bus_array`도 동일한 `_branch_line_idxs` 정렬을
+      공유하므로 같은 규약이 유지된다.
+    - pandapower의 `res_line.q_from_mvar`는 "from_bus에서 그 선로로 흘러 들어가는" 무효
+      전력이다(probe_q_marginal.py 모듈 docstring에서 이미 실측 확인된 규약 - 이 스크립트가
+      새로 검증하는 것이 아니라 그 결론을 재사용한다).
+    - `Qe_base = D@(load_q/S_BASE)`는 "그 branch 하류 전체 부하의 무효전력 합"이며 부하는
+      소비(양수)이므로 Qe_base는 항상 >=0이다(하류에 ESS가 없는 이 기저 상태에서는).
+    해석/가설: 위 둘 다 "상류->하류 방향으로 흐르는, 부하가 끌어가는 무효전력"을 가리키므로
+    부호를 뒤집지 않고 그대로 비교해야 한다 - 그러나 이것이 "가정"인지 "실측 확인"인지는
+    아래에서 직접 센 부호 불일치 건수로 판별한다(관찰과 추론을 구분 - 지시서 요구)."""
+    section('작업B-4: 부호 규약 확인 (q_from_mvar vs Qe_base, 뒤집지 않고 그대로 비교)')
+    total_checked, total_mismatch = 0, 0
+    for s in PM.AVG_DAYS:
+        Qe_base = _compute_qe_base_mvar(topo, PM.LOAD[s])   # (n_branch,T), 항상 >=0(부하 소비)
+        q_from = ac_flow_table[s]['q_from']
+        mask = np.abs(Qe_base) >= 0.001   # 거의 0인 분기(말단 등)는 부호 자체가 잡음일 수 있어 제외
+        mismatch = np.sum((q_from[mask] > 0) != (Qe_base[mask] > 0))
+        total_checked += int(np.sum(mask))
+        total_mismatch += int(mismatch)
+    print(f"  Qe_base>=0.001Mvar인 (branch,scenario,t) {total_checked}개 중 "
+          f"sign(q_from_mvar) != sign(Qe_base) 불일치 = {total_mismatch}건", flush=True)
+    if total_mismatch == 0:
+        print("  -> 관찰: 불일치 0건. 위 해석(부호를 뒤집지 않는다)이 이 데이터에서 실측으로도 "
+              "확인됨.", flush=True)
+    else:
+        print(f"  -> ⚠ 관찰: 불일치 {total_mismatch}건 존재. 아래 B-3 비율(ratio_from/"
+              "ratio_to)을 해석하기 전에 이 불일치가 어느 branch/scenario/t에서 나는지 "
+              "먼저 좁혀볼 것(이 함수는 집계만 하고 원인을 판정하지 않는다).", flush=True)
+
+
+def _print_qe_base_ac_comparison(ac_flow_table, topo):
+    """지시서 작업B-3: |q_from|/Qe_base, |q_to|/Qe_base의 분포(전체 + 통제점 경로만).
+    Qe_base<0.001Mvar인 branch는 비가 발산하므로 제외하고 제외 건수를 보고한다.
+    판정 없음 - 수치만."""
+    section('작업B-3: |AC q_from,to| / Qe_base 비율 분포 (판정 없음 - 수치만)')
+    D = topo['D']
+    for s in PM.AVG_DAYS:
+        Qe_base = _compute_qe_base_mvar(topo, PM.LOAD[s])
+        q_from = ac_flow_table[s]['q_from']
+        q_to = ac_flow_table[s]['q_to']
+
+        denom_ok = np.abs(Qe_base) >= 0.001
+        n_excluded = int(np.sum(~denom_ok))
+        ratio_from = np.abs(q_from[denom_ok]) / np.abs(Qe_base[denom_ok])
+        ratio_to = np.abs(q_to[denom_ok]) / np.abs(Qe_base[denom_ok])
+        pf = np.percentile(ratio_from, [0, 25, 50, 75, 100])
+        pt = np.percentile(ratio_to, [0, 25, 50, 75, 100])
+        print(f"\n  [{s}] 전체 {Qe_base.size}개 (branch,t) 중 분모<0.001Mvar 제외 "
+              f"{n_excluded}개", flush=True)
+        print(f"    ratio_from(|q_from|/Qe_base): min={pf[0]:.4f} p25={pf[1]:.4f} "
+              f"median={pf[2]:.4f} p75={pf[3]:.4f} max={pf[4]:.4f}", flush=True)
+        print(f"    ratio_to  (|q_to|/Qe_base)  : min={pt[0]:.4f} p25={pt[1]:.4f} "
+              f"median={pt[2]:.4f} p75={pt[3]:.4f} max={pt[4]:.4f}", flush=True)
+
+        for point in POINTS:
+            bus = int(point['b'])
+            path_e = _path_branches_for_bus(D, bus)
+            if len(path_e) == 0:
+                print(f"    {point['point_id']}(bus={bus}): 경로 선로 없음", flush=True)
+                continue
+            sub_ok = denom_ok[path_e, :]
+            sub_from = np.abs(q_from[path_e, :])[sub_ok] / np.abs(Qe_base[path_e, :])[sub_ok]
+            sub_to = np.abs(q_to[path_e, :])[sub_ok] / np.abs(Qe_base[path_e, :])[sub_ok]
+            if sub_from.size == 0:
+                print(f"    {point['point_id']}(bus={bus}, 경로선로 {len(path_e)}개): "
+                      "유효 표본 없음(전부 분모<0.001Mvar)", flush=True)
+                continue
+            pfb = np.percentile(sub_from, [0, 25, 50, 75, 100])
+            ptb = np.percentile(sub_to, [0, 25, 50, 75, 100])
+            print(f"    {point['point_id']}(bus={bus}, 경로선로 {len(path_e)}개, "
+                  f"유효표본 {sub_from.size}개): ratio_from min={pfb[0]:.4f} "
+                  f"p25={pfb[1]:.4f} median={pfb[2]:.4f} p75={pfb[3]:.4f} max={pfb[4]:.4f} / "
+                  f"ratio_to min={ptb[0]:.4f} p25={ptb[1]:.4f} median={ptb[2]:.4f} "
+                  f"p75={ptb[3]:.4f} max={ptb[4]:.4f}", flush=True)
+
+
+# ============================================================
+# 1-C) 계측 추가 라운드 - 작업 C: 손실 공식·전압 규약의 항등성 검증
+# ============================================================
+
+def _print_loss_formula_identity_check(ac_flow_table, v_bus_table, net):
+    """지시서 작업C: loss=r*(P^2+Q^2)/V^2이 실제 AC 조류계산 결과에서 재현되는지 확인한다.
+
+    단위계(지시서 요구 - 명시): 물리단위(Ohm/MW/MVAr/kV)를 쓴다.
+      r_ohm = r_pu * PM.Z_BASE_OHM   (lower_lp.py가 r_pu = r_ohm_per_km*length_km/Z_BASE_OHM
+                                       으로 만든 것의 역연산)
+      V_kv  = vm_pu * PM.VN_KV       (실제 선간전압, kV)
+      loss_calc = r_ohm * (P_mw^2 + Q_mvar^2) / V_kv^2   [MW]
+    이 (Ohm,MW,MVAr,kV) 조합에서 위 식은 3상 등가회로의 표준 관계식이며 별도 배수가
+    필요 없다(pandapower 자신이 res_line을 이 관례로 계산한다) - pu로도 검산할 수 있었으나
+    lower_lp.py의 pu 변환(r_pu 등)이 맞는지까지 함께 확인하는 효과가 있어 물리단위를 택했다.
+    판정 없음 - 상대오차 분포만 낸다."""
+    section('작업C: 손실공식(loss=r*(P^2+Q^2)/V^2) 항등성 검증 (판정 없음 - 오차 분포만)')
+    topo = lower_lp._get_topology()
+    r_pu = topo['r_pu']
+    r_ohm = r_pu * PM.Z_BASE_OHM
+    from_bus_arr = _branch_from_bus_array(net)
+    to_bus_arr = _branch_to_bus_array(net)
+
+    for s in PM.AVG_DAYS:
+        p_from, q_from = ac_flow_table[s]['p_from'], ac_flow_table[s]['q_from']
+        p_to, q_to = ac_flow_table[s]['p_to'], ac_flow_table[s]['q_to']
+        pl = ac_flow_table[s]['pl']
+        vm = v_bus_table[s]   # (n_bus,T), raw vm_pu
+
+        v_from_kv = vm[from_bus_arr, :] * PM.VN_KV
+        v_to_kv = vm[to_bus_arr, :] * PM.VN_KV
+
+        loss_calc_from = r_ohm[:, None] * (p_from ** 2 + q_from ** 2) / (v_from_kv ** 2)
+        loss_calc_to = r_ohm[:, None] * (p_to ** 2 + q_to ** 2) / (v_to_kv ** 2)
+
+        mask = np.abs(pl) > 1e-12   # 0으로 나누기 방지 - pl~=0인 (branch,t) 제외
+        n_excl = int(np.sum(~mask))
+        rel_err_from = np.abs(loss_calc_from[mask] - pl[mask]) / np.abs(pl[mask])
+        rel_err_to = np.abs(loss_calc_to[mask] - pl[mask]) / np.abs(pl[mask])
+        pf = np.percentile(rel_err_from, [0, 50, 100])
+        pt = np.percentile(rel_err_to, [0, 50, 100])
+        print(f"  [{s}] pl_mw~=0(<=1e-12) 제외 {n_excl}개  "
+              f"from단 상대오차: min={pf[0]:.3e} median={pf[1]:.3e} max={pf[2]:.3e}  "
+              f"to단 상대오차: min={pt[0]:.3e} median={pt[1]:.3e} max={pt[2]:.3e}", flush=True)
+
+
+# ============================================================
+# 1-D) 계측 추가 라운드 - 작업 A-2/A-3/A-4: AC 되먹임 성분 분해
+# ============================================================
+
+def _qp_predicted_A(bus, s, q_level, v_sq_line_table):
+    """QP(보정후)가 예측하는 손실저감량 A' - _diagnose_q_prediction_gap의 qp_corr_t와
+    동일한 공식을 **독립적으로 재구현**한다(공유 함수로 리팩터링하지 않는다 - 지시서
+    작업A-3의 "A'/dLoss_total이 기존 비율분포와 일치해야 한다"는 두 개의 독립 구현이
+    일치하는지 보는 교차검증이므로, 하나로 합치면 그 검증이 자기 자신과 비교하는
+    동어반복이 된다). D@(bus_onehot.T@q) 구조상 dQe는 그 bus의 슬랙 경로(path) 밖의
+    branch에서 자동으로 0이 되므로, 전 branch에 대한 합이 곧 지시서가 요구한
+    "sum_{e in path}"와 수학적으로 동치다(별도 경로 필터가 필요 없다)."""
+    topo = lower_lp._get_topology()
+    D, r_pu, n_bus = topo['D'], topo['r_pu'], topo['n_bus']
+    bus_onehot_np = np.zeros((1, n_bus))
+    bus_onehot_np[0, bus] = 1.0
+    _base_load_p_bus, base_load_q_bus = lower_lp.base_load_bus_arrays()
+    profile = np.asarray(PM.LOAD[s], dtype=float)
+    load_q_val = base_load_q_bus[:, None] * profile[None, :]
+    Qe_base = D @ (load_q_val / PM.S_BASE_MVA)
+    q_fixed = np.full((1, PM.TIME_STEPS), q_level)
+    dQe = D @ ((bus_onehot_np.T @ q_fixed) / PM.S_BASE_MVA)
+    per_branch_uncorr = r_pu[:, None] * (2.0 * Qe_base * dQe - dQe ** 2) * PM.S_BASE_MVA
+    v_sq = v_sq_line_table[s]
+    return (per_branch_uncorr / v_sq).sum(axis=0)   # (T,)
+
+
+def _decompose_ac_feedback(ac_full_table, loss_table, from_bus_arr, bus, s, q_level):
+    """작업A-2: loss=r*(P^2+Q^2)/V^2 항등식(작업C에서 이미 확인됨 - 같은 r_ohm/V-in-kV
+    단위계를 그대로 쓴다)으로 q=0->q_level 손실 변화를 A(Q항)+B(P항)+C(V항)으로
+    정확히 쪼갠다.
+
+    ★ 첨자 0/q가 같은 (scenario,t)에서 온 데이터임을 보장하는 방법(지시서 보고 요구 3):
+    ac_full_table[bus][s]의 배열은 shape (T, n_q, n_branch)다 - t축은 그대로 유지한 채
+    idx0/idxq로 **n_q축만** 인덱싱하므로(`tbl['p_from'][:, idx0, :]` vs
+    `[:, idxq, :]`), 두 슬라이스는 항상 동일한 T개 행(=동일 시각들)을 가리킨다. 이는
+    "시각을 맞춰 찾는" 별도 매칭 로직이 아니라 배열 축 구조 자체가 강제하는 것이다 -
+    t번째 행끼리 어긋날 방법이 없다(같은 배열의 같은 축이므로).
+
+    반환: A,B,C,dLoss_total 각 (T,) - dLoss_total은 loss_table(실측 총손실)에서 직접
+    구한다(=검산 대상 - A+B+C가 이것과 같아야 한다)."""
+    idx0 = Q_BOUNDARY_POINTS.index(0.0)
+    idxq = Q_BOUNDARY_POINTS.index(q_level)
+    tbl = ac_full_table[bus][s]
+    topo = lower_lp._get_topology()
+    r_ohm = topo['r_pu'] * PM.Z_BASE_OHM   # (n_branch,) - 작업C와 동일 역연산
+
+    A, B, C = _decompose_flow_pair(
+        tbl['p_from'][:, idx0, :], tbl['q_from'][:, idx0, :],
+        tbl['vm_bus'][:, idx0, :], tbl['p_from'][:, idxq, :],
+        tbl['q_from'][:, idxq, :], tbl['vm_bus'][:, idxq, :],
+        from_bus_arr, r_ohm,
+    )
+    dLoss_total = loss_table[bus][s][:, idx0] - loss_table[bus][s][:, idxq]
+    return A, B, C, dLoss_total
+
+
+def _decompose_flow_pair(P_e0, Q_e0, vm_bus0, P_eq, Q_eq, vm_busq,
+                         from_bus_arr, r_ohm):
+    """동일 운전점의 q=0/q>0 AC 상태를 A(Q)+B(P)+C(V)로 분해하는 공통 수식.
+
+    첫 축은 표본 축이며 단일 표본을 넘길 때도 shape (1,n_branch)/(1,n_bus)로 맞춘다.
+    `_decompose_ac_feedback`과 별도 P 스윕이 이 한 코드 경로를 공유한다.
+    """
+    P_e0 = np.atleast_2d(np.asarray(P_e0, dtype=float))
+    Q_e0 = np.atleast_2d(np.asarray(Q_e0, dtype=float))
+    P_eq = np.atleast_2d(np.asarray(P_eq, dtype=float))
+    Q_eq = np.atleast_2d(np.asarray(Q_eq, dtype=float))
+    vm_bus0 = np.atleast_2d(np.asarray(vm_bus0, dtype=float))
+    vm_busq = np.atleast_2d(np.asarray(vm_busq, dtype=float))
+    V_e0_kv_sq = (vm_bus0[:, from_bus_arr] * PM.VN_KV) ** 2
+    V_eq_kv_sq = (vm_busq[:, from_bus_arr] * PM.VN_KV) ** 2
+    A = np.sum(r_ohm[None, :] * (Q_e0 ** 2 - Q_eq ** 2) / V_e0_kv_sq, axis=1)
+    B = np.sum(r_ohm[None, :] * (P_e0 ** 2 - P_eq ** 2) / V_e0_kv_sq, axis=1)
+    C = np.sum(
+        r_ohm[None, :] * (P_eq ** 2 + Q_eq ** 2)
+        * (1.0 / V_e0_kv_sq - 1.0 / V_eq_kv_sq),
+        axis=1,
+    )
+    return A, B, C
+
+
+def _alpha_by_point_and_level(ac_full_table, loss_table, net):
+    """작업 2/4가 공유하는 실행 중 실측 alpha=A/dLoss의 통제점별 분포."""
+    from_bus_arr = _branch_from_bus_array(net)
+    result = {}
+    for point in POINTS:
+        bus = int(point['b'])
+        result[point['point_id']] = {}
+        pooled_A, pooled_dloss = [], []
+        for q_level in Q_DIAG_LEVELS:
+            A_all, dloss_all = [], []
+            for s in PM.AVG_DAYS:
+                A, _B, _C, dloss = _decompose_ac_feedback(
+                    ac_full_table, loss_table, from_bus_arr, bus, s, q_level
+                )
+                A_all.append(A)
+                dloss_all.append(dloss)
+            A_arr = np.concatenate(A_all)
+            dloss_arr = np.concatenate(dloss_all)
+            mask = dloss_arr != 0.0
+            alpha = float(np.median(A_arr[mask] / dloss_arr[mask])) if np.any(mask) else np.nan
+            result[point['point_id']][q_level] = alpha
+            pooled_A.append(A_arr)
+            pooled_dloss.append(dloss_arr)
+        A_pool = np.concatenate(pooled_A)
+        dloss_pool = np.concatenate(pooled_dloss)
+        pool_mask = dloss_pool != 0.0
+        result[point['point_id']]['pooled'] = (
+            float(np.median(A_pool[pool_mask] / dloss_pool[pool_mask]))
+            if np.any(pool_mask) else np.nan
+        )
+    return result
+
+
+ALPHA_CSV_FIELDS = [
+    'point_id', 'bus', 'S', 'p_level', 'q_level', 'feasible', 'n_samples',
+    'alpha_median', 'dloss_ratio_to_p0_median', 'identity_abs_max_mw',
+]
+ALPHA_RAW_CSV_FIELDS = [
+    'point_id', 'bus', 'S', 'scenario', 't', 'p_level', 'q_level', 'feasible',
+    'A', 'B', 'C', 'dLoss_total', 'alpha', 'dloss_ratio_to_p0',
+    'identity_abs_mw',
+]
+
+
+def _measure_alpha_p_sweep(net, base_p, base_q):
+    """작업 3: 기존 P_inj=0 loss_table을 건드리지 않는 별도 P×Q AC 진단.
+
+    부호는 lower_lp.py의 `P_net=P_dis-P_ch`와 evaluate.py의
+    `net.sgen.at[i,'p_mw']=unit_p-loss_pcs`를 따른다. 따라서 여기서 p>0은 방전 주입,
+    p<0은 충전 흡수다. PCS 손실은 이 진단 격자에 별도로 넣지 않는다.
+    """
+    if len(net.sgen) == 0:
+        pp.create_sgen(net, bus=CONTROL_POINT_BUSES[0], p_mw=0.0, q_mvar=0.0,
+                       name='probe_lp_loss_proto_alpha')
+    sgen_idx = net.sgen.index[0]
+    line_idxs = _branch_line_idxs(net)
+    from_bus_arr = _branch_from_bus_array(net)
+    r_ohm = lower_lp._get_topology()['r_pu'] * PM.Z_BASE_OHM
+    q_levels = [0.0] + Q_DIAG_LEVELS
+    expected = (
+        len(POINTS) * len(PM.AVG_DAYS) * PM.TIME_STEPS * 5 * len(q_levels)
+    )
+    print(f"alpha P×Q 스윕 예상 격자 조류계산 횟수={expected} "
+          f"({len(POINTS)} point x {len(PM.AVG_DAYS)} scenario x "
+          f"{PM.TIME_STEPS} h x 5 P x {len(q_levels)} Q)", flush=True)
+    print("P 부호 규약: lower_lp.py P_net=P_dis-P_ch, evaluate.py sgen.p_mw=unit_p-loss_pcs; "
+          "p>0 방전 주입, p<0 충전 흡수", flush=True)
+
+    buckets = {}
+    for point in POINTS:
+        pid, bus, S = point['point_id'], int(point['b']), float(point['S'])
+        p_levels = [-S, -S / 2.0, 0.0, S / 2.0, S]
+        for p_level in p_levels:
+            for q_level in q_levels:
+                buckets[(pid, p_level, q_level)] = dict(
+                    alpha=[], identity=[], dloss_ratio=[]
+                )
+    raw_rows = []
+    for point in POINTS:
+        pid, bus, S = point['point_id'], int(point['b']), float(point['S'])
+        p_levels = [-S, -S / 2.0, 0.0, S / 2.0, S]
+        for s in PM.AVG_DAYS:
+            profile = PM.LOAD[s]
+            for t in range(PM.TIME_STEPS):
+                net.load['p_mw'] = base_p * profile[t]
+                net.load['q_mvar'] = base_q * profile[t]
+                for p_level in p_levels:
+                    base_state = None
+                    for q_level in q_levels:
+                        net.sgen.at[sgen_idx, 'bus'] = bus
+                        net.sgen.at[sgen_idx, 'p_mw'] = p_level
+                        net.sgen.at[sgen_idx, 'q_mvar'] = q_level
+                        ok = evaluate._run_pf_with_retry(net)
+                        if not ok:
+                            raise RuntimeError(
+                                f"alpha P×Q 조류계산 발산: point={pid} scenario={s} t={t} "
+                                f"p={p_level} q={q_level}"
+                            )
+                        state = dict(
+                            p_from=net.res_line.loc[line_idxs, 'p_from_mw'].to_numpy(),
+                            q_from=net.res_line.loc[line_idxs, 'q_from_mvar'].to_numpy(),
+                            vm_bus=net.res_bus.vm_pu.to_numpy(),
+                            loss=float(net.res_line.pl_mw.sum()),
+                        )
+                        bucket = buckets[(pid, p_level, q_level)]
+                        if q_level == 0.0:
+                            base_state = state
+                            bucket['identity'].append(0.0)
+                            raw_rows.append(dict(
+                                point_id=pid, bus=bus, S=S, scenario=s, t=t,
+                                p_level=p_level, q_level=q_level,
+                                feasible=bool(p_level ** 2 + q_level ** 2 <= S ** 2),
+                                A=0.0, B=0.0, C=0.0, dLoss_total=0.0,
+                                alpha=np.nan, dloss_ratio_to_p0=np.nan,
+                                identity_abs_mw=0.0,
+                            ))
+                            continue
+                        A, B, C = _decompose_flow_pair(
+                            base_state['p_from'], base_state['q_from'], base_state['vm_bus'],
+                            state['p_from'], state['q_from'], state['vm_bus'],
+                            from_bus_arr, r_ohm,
+                        )
+                        dloss = base_state['loss'] - state['loss']
+                        identity = abs(float(A[0] + B[0] + C[0]) - dloss)
+                        bucket['identity'].append(identity)
+                        alpha_value = np.nan
+                        if dloss != 0.0:
+                            alpha_value = float(A[0]) / dloss
+                            bucket['alpha'].append(alpha_value)
+                        raw_rows.append(dict(
+                            point_id=pid, bus=bus, S=S, scenario=s, t=t,
+                            p_level=p_level, q_level=q_level,
+                            feasible=bool(p_level ** 2 + q_level ** 2 <= S ** 2),
+                            A=float(A[0]), B=float(B[0]), C=float(C[0]),
+                            dLoss_total=dloss, alpha=alpha_value,
+                            dloss_ratio_to_p0=np.nan, identity_abs_mw=identity,
+                        ))
+
+    p0_dloss = {
+        (row['point_id'], row['scenario'], row['t'], row['q_level']): row['dLoss_total']
+        for row in raw_rows if row['p_level'] == 0.0
+    }
+    for row in raw_rows:
+        denom = p0_dloss[(row['point_id'], row['scenario'], row['t'], row['q_level'])]
+        if denom != 0.0:
+            ratio = row['dLoss_total'] / denom
+            row['dloss_ratio_to_p0'] = ratio
+            buckets[(row['point_id'], row['p_level'], row['q_level'])][
+                'dloss_ratio'
+            ].append(ratio)
+
+    rows = []
+    section('작업 3: alpha의 P×Q 정의역 스윕 (A/dLoss median, 판정 없음)')
+    for point in POINTS:
+        pid, bus, S = point['point_id'], int(point['b']), float(point['S'])
+        p_levels = [-S, -S / 2.0, 0.0, S / 2.0, S]
+        print(f"\n  {pid} (bus={bus}, S={S}):", flush=True)
+        print("    p_level     q_level   feasible  alpha_median  "
+              "dLoss(p,q)/dLoss(0,q) median  identity_max_MW", flush=True)
+        for p_level in p_levels:
+            for q_level in q_levels:
+                bucket = buckets[(pid, p_level, q_level)]
+                alpha_median = (
+                    float(np.median(bucket['alpha'])) if bucket['alpha'] else np.nan
+                )
+                identity_max = (
+                    float(np.max(bucket['identity'])) if bucket['identity'] else np.nan
+                )
+                dloss_ratio_median = (
+                    float(np.median(bucket['dloss_ratio']))
+                    if bucket['dloss_ratio'] else np.nan
+                )
+                feasible = bool(p_level ** 2 + q_level ** 2 <= S ** 2)
+                print(f"    {p_level:+.6f}  {q_level:.6f}  {str(feasible):>8}  "
+                      f"{alpha_median:12.6f}  {dloss_ratio_median:14.6f}  "
+                      f"{identity_max:.3e}", flush=True)
+                rows.append(dict(
+                    point_id=pid, bus=bus, S=S, p_level=p_level, q_level=q_level,
+                    feasible=feasible, n_samples=len(bucket['identity']),
+                    alpha_median=alpha_median,
+                    dloss_ratio_to_p0_median=dloss_ratio_median,
+                    identity_abs_max_mw=identity_max,
+                ))
+    return rows, raw_rows, expected
+
+
+def _write_alpha_csv(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=ALPHA_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"alpha P×Q CSV 저장: {path}", flush=True)
+
+
+def _write_alpha_raw_csv(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=ALPHA_RAW_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"alpha P×Q 원값 CSV 저장: {path}", flush=True)
+
+
+def _ratio_percentiles(num_arr, denom_arr):
+    mask = denom_arr != 0.0
+    n_excl = int(np.sum(~mask))
+    if not np.any(mask):
+        return None, n_excl
+    return np.percentile(num_arr[mask] / denom_arr[mask], [0, 25, 50, 75, 100]), n_excl
+
+
+def _print_ac_feedback_decomposition(ac_full_table, loss_table, v_sq_line_table, net):
+    """작업A-2/A-3: 판정 없음 - 항등성 잔차(구현 검증, 지시서상 예외로 허용됨)와 비율
+    분포만 낸다."""
+    section('작업A-2/A-3: AC 되먹임 성분 분해 (A=Q항,B=P항,C=V항, A\'=QP예측) - '
+            '판정 없음, 항등성만 검산')
+    from_bus_arr = _branch_from_bus_array(net)
+    for point in POINTS:
+        bus = int(point['b'])
+        if bus not in ac_full_table:
+            continue
+        print(f"\n  {point['point_id']} (bus={bus}):", flush=True)
+        for q_level in Q_DIAG_LEVELS:
+            A_list, B_list, C_list, dtot_list, Aqp_list = [], [], [], [], []
+            for s in PM.AVG_DAYS:
+                A, B, C, dtot = _decompose_ac_feedback(ac_full_table, loss_table, from_bus_arr,
+                                                        bus, s, q_level)
+                Aqp = _qp_predicted_A(bus, s, q_level, v_sq_line_table)
+                A_list.append(A); B_list.append(B); C_list.append(C)
+                dtot_list.append(dtot); Aqp_list.append(Aqp)
+            A_arr = np.concatenate(A_list)
+            B_arr = np.concatenate(B_list)
+            C_arr = np.concatenate(C_list)
+            dtot_arr = np.concatenate(dtot_list)
+            Aqp_arr = np.concatenate(Aqp_list)
+
+            identity_resid = np.abs(A_arr + B_arr + C_arr - dtot_arr)
+            print(f"    Q={q_level}: 항등성 |A+B+C-dLoss_total| 분포(MW, 구현 검증 - "
+                  f"기계정밀도 수준이 아니면 구현을 의심할 것): "
+                  f"min={identity_resid.min():.3e} median={np.median(identity_resid):.3e} "
+                  f"max={identity_resid.max():.3e}", flush=True)
+
+            for label, num_arr, denom_arr in (
+                ('A/dLoss_total', A_arr, dtot_arr),
+                ('B/dLoss_total', B_arr, dtot_arr),
+                ('C/dLoss_total', C_arr, dtot_arr),
+                ("A'/A", Aqp_arr, A_arr),
+                ("A'/dLoss_total", Aqp_arr, dtot_arr),
+            ):
+                pct, n_excl = _ratio_percentiles(num_arr, denom_arr)
+                if pct is None:
+                    print(f"      {label}: 전 표본 분모=0 - 비 정의 불가", flush=True)
+                else:
+                    print(f"      {label}(분모=0 {n_excl}건 제외): min={pct[0]:.4f} "
+                          f"p25={pct[1]:.4f} median={pct[2]:.4f} p75={pct[3]:.4f} "
+                          f"max={pct[4]:.4f}", flush=True)
+
+
+def _print_dqe_ratio(ac_full_table):
+    """작업A-4: 경로 선로에서 (Q_e0-Q_eq)/q 분포. 판정 없음 - 수치만."""
+    section("작업A-4: 실제 무효조류 감소량(dQe)/주입량(q) 비 (경로 선로만, 판정 없음)")
+    topo = lower_lp._get_topology()
+    D = topo['D']
+    for point in POINTS:
+        bus = int(point['b'])
+        if bus not in ac_full_table:
+            continue
+        path_e = _path_branches_for_bus(D, bus)
+        print(f"\n  {point['point_id']} (bus={bus}, 경로선로 {len(path_e)}개):", flush=True)
+        if len(path_e) == 0:
+            print("    경로 선로 없음", flush=True)
+            continue
+        idx0 = Q_BOUNDARY_POINTS.index(0.0)
+        for q_level in Q_DIAG_LEVELS:
+            idxq = Q_BOUNDARY_POINTS.index(q_level)
+            vals = []
+            for s in PM.AVG_DAYS:
+                tbl = ac_full_table[bus][s]
+                Q_e0 = tbl['q_from'][:, idx0, :][:, path_e]
+                Q_eq = tbl['q_from'][:, idxq, :][:, path_e]
+                vals.append(((Q_e0 - Q_eq) / q_level).ravel())
+            arr = np.concatenate(vals)
+            pct = np.percentile(arr, [0, 25, 50, 75, 100])
+            print(f"    Q={q_level}: dQe/q 분포: min={pct[0]:.4f} p25={pct[1]:.4f} "
+                  f"median={pct[2]:.4f} p75={pct[3]:.4f} max={pct[4]:.4f}", flush=True)
+
+
+# ============================================================
 # 2) 프로토타입 LP 빌더 (avg 전용 - kind='peak'은 3차 개정에서 완전히 제거)
 # ============================================================
 
@@ -558,14 +1491,26 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
     lower_lp.py 원본은 이 함수가 건드리지 않는다(읽기 전용 재사용: _get_topology()).
 
     bus_idx: None이면 bus_onehot을 기존처럼 cp.Parameter로 둔다(포인트마다 값만 바꿔
-    재사용 - method='pwl'용). 정수면 bus_onehot을 그 버스로 구운 numpy 상수로 굽는다
-    (파라미터가 아니므로 이 Problem은 그 버스 전용이 되고 포인트마다 새로 지어야 한다 -
-    method='qp' 전용, 모듈 docstring "QP 전개" 절 참조: dQ_e/dP_e를 제곱하려면 그
-    계수(bus_onehot)가 파라미터가 아니라 상수여야 DPP가 유지된다).
+    재사용 - method='pwl'/'none'/'pcs_only'용). 정수면 bus_onehot을 그 버스로 구운
+    numpy 상수로 굽는다(파라미터가 아니므로 이 Problem은 그 버스 전용이 되고 포인트마다
+    새로 지어야 한다 - method='qp' 전용, 모듈 docstring "QP 전개" 절 참조: dQ_e/dP_e를
+    제곱하려면 그 계수(bus_onehot)가 파라미터가 아니라 상수여야 DPP가 유지된다).
+
+    ★ 계측 추가 라운드 작업C-2 신규 method:
+      'none'     - 기준1(force_q_zero=True 등가). Q 자체가 없다(cp.Constant(0)) - 다각형/
+                   s_app/q_penalty를 아예 만들지 않는다(lower_lp.py 원본의 force_q_zero=True
+                   경로가 "다각형은 걸지 않는다"는 것과 동일한 관례 - 그래야
+                   P_ch<=S,P_dis<=S 개별한계만 남아 진짜 force_q_zero=True와 동등해진다.
+                   s_app<=S*cos(pi/N)까지 남기면 원 제약이 3.53% 더 좁아져 "등가"가 깨진다).
+      'pcs_only' - 기준2. Q는 pwl/qp와 똑같이 자유(다각형/s_app/q_penalty/SOC/사이클
+                   등식 전부 그대로) - **loss_term만 0**으로 둬 손실 편익/비용 항의
+                   존재 자체가 만드는 비용을 손실 항의 크기와 분리해서 잰다(지시서 C-2/
+                   보고요청5 - "나머지는 그대로 두었는지 확인").
     """
+    assert method in ('pwl', 'qp', 'none', 'pcs_only'), f'알 수 없는 method: {method}'
     assert (method == 'qp') == (bus_idx is not None), (
-        f"method={method}, bus_idx={bus_idx}: QP는 bus_idx 필수(build-time 상수 소성), "
-        "PWL은 bus_idx를 주지 않는다(Parameter로 유지해 포인트 간 재사용)."
+        f"method={method}, bus_idx={bus_idx}: QP만 bus_idx 필수(build-time 상수 소성), "
+        "나머지(pwl/none/pcs_only)는 bus_idx를 주지 않는다(Parameter로 유지해 재사용)."
     )
 
     dt = PM.DT_HOURS
@@ -578,8 +1523,11 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
     P_ch = cp.Variable((n, T), nonneg=True)
     P_dis = cp.Variable((n, T), nonneg=True)
     soc = cp.Variable((n, T + 1))
-    s_app = cp.Variable((n, T), nonneg=True)
-    q_penalty = cp.Variable((n, T), nonneg=True)
+
+    # ★ 기준1('none')만 다각형/s_app/q_penalty를 아예 안 만든다 - 위 docstring 참조.
+    has_pcs_polygon = (method != 'none')
+    s_app = cp.Variable((n, T), nonneg=True) if has_pcs_polygon else None
+    q_penalty = cp.Variable((n, T), nonneg=True) if has_pcs_polygon else None
 
     lhs_params = None
     if method == 'pwl':
@@ -591,11 +1539,24 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
         # 있다). nonneg=True로 선언했다가 실측 데이터의 음수 기울기로 "Parameter value must
         # be nonnegative" 에러가 실제로 났었다 - 물리적으로 정상이므로 제약을 없앤다.
         lhs_params = [cp.Parameter((n, T)) for _ in range(M)]
-    elif method == 'qp':
+    elif method in ('qp', 'pcs_only'):
         Q_seg = None
         Q = cp.Variable((n, T))
-    else:
-        raise ValueError(method)
+    else:   # method == 'none'
+        Q_seg = None
+        # ★ 버그 수정(2차분 진단): 여기를 cp.Constant(np.zeros(...))로 두면 netinj_q =
+        # (load_q_bus - bus_onehot.T@Q)/S_BASE_MVA에 변수가 전혀 안 남는다(Q도 상수,
+        # load_q_bus/bus_onehot은 Parameter라 전부 "Parameter뿐인 affine식"이 됨). 이
+        # 변수 0개 상태로 스칼라 나눗셈(div)을 cvxpy COO 백엔드가 canonicalize하면
+        # coo_mul_elem의 rhs가 (33,24) dense_const로 브로드캐스트돼 "일반 케이스"(스칼라
+        # 브로드캐스트 분기를 못 타는 경로)로 빠지고, 그 안에서 `mask = rhs_vals != 0`가
+        # scipy sparse 객체의 __bool__을 건드려 "The truth value of an array with more
+        # than one element is ambiguous" 예외를 던진다(전 솔버 공통이라 4회 재시도가
+        # 전부 실패 -> status=None). lower_lp.py 원본의 force_q_zero=True 관례를 그대로
+        # 따라 Q를 Variable로 유지하고 등식제약 Q==0으로 강제한다 - 그러면 netinj_q에
+        # Variable이 남아 이 버그 경로를 타지 않는다(값·최적해는 상수 대입과 수학적으로
+        # 동일 - Q==0이 유일해이므로).
+        Q = cp.Variable((n, T))
 
     if bus_idx is None:
         bus_onehot = cp.Parameter((n, n_bus))
@@ -635,18 +1596,25 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
 
     P_net = P_dis - P_ch
 
-    # ---- 다각형: 고정 s_cap 대신 변수 s_app (모듈 docstring "PCS 손실 항" 참조) ----
-    for k in range(PM.POLY_N):
-        theta = 2.0 * np.pi * k / PM.POLY_N
-        constraints.append(P_net * float(np.cos(theta)) + Q * float(np.sin(theta)) <= s_app)
-    # ★ 4차 개정 버그 수정: s_app<=S_col이면 다각형이 반지름 S 원을 **바깥에서 감싸**
-    # (circumscribed) 1/cos(pi/N)=3.53%(N=12) 초과 운전점을 허용한다(실측: P1에서
-    # (P,Q)=(0.176,0.0472), 피상전력 0.1822=1.0353*S). 원본 lower_lp.py는 s_cap을
-    # S*cos(pi/N)로 둬 다각형을 원에 **내접**시킨다(꼭짓점이 원 위, 절대 원 밖으로
-    # 못 나감) - 그 관례를 그대로 따른다.
-    s_cap = S_col * float(np.cos(np.pi / PM.POLY_N))
-    constraints.append(s_app <= s_cap)
-    constraints.append(q_penalty >= s_app - P_ch - P_dis)
+    if has_pcs_polygon:
+        # ---- 다각형: 고정 s_cap 대신 변수 s_app (모듈 docstring "PCS 손실 항" 참조) ----
+        for k in range(PM.POLY_N):
+            theta = 2.0 * np.pi * k / PM.POLY_N
+            constraints.append(P_net * float(np.cos(theta)) + Q * float(np.sin(theta)) <= s_app)
+        # ★ 4차 개정 버그 수정: s_app<=S_col이면 다각형이 반지름 S 원을 **바깥에서 감싸**
+        # (circumscribed) 1/cos(pi/N)=3.53%(N=12) 초과 운전점을 허용한다(실측: P1에서
+        # (P,Q)=(0.176,0.0472), 피상전력 0.1822=1.0353*S). 원본 lower_lp.py는 s_cap을
+        # S*cos(pi/N)로 둬 다각형을 원에 **내접**시킨다(꼭짓점이 원 위, 절대 원 밖으로
+        # 못 나감) - 그 관례를 그대로 따른다.
+        s_cap = S_col * float(np.cos(np.pi / PM.POLY_N))
+        constraints.append(s_app <= s_cap)
+        constraints.append(q_penalty >= s_app - P_ch - P_dis)
+    else:   # method == 'none'
+        # 다각형/s_app/q_penalty는 안 건다(위 docstring) - 대신 Q를 Variable인 채로
+        # 0에 등식제약한다(위 Q 선언부 주석의 cvxpy div 버그 회피와 동일 이유).
+        # P_ch<=S,P_dis<=S 개별한계만 남아 lower_lp.py 원본의 force_q_zero=True와
+        # 동등해진다(위 docstring 참조).
+        constraints.append(Q == 0)
 
     if method == 'pwl':
         boundaries = SEGMENT_BOUNDARIES[M]
@@ -672,7 +1640,10 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
         cp.pos(v_nonslack - PM.V_SQ_MAX) + cp.pos(PM.V_SQ_MIN - v_nonslack)
     )
 
-    pcs_cost = float(C_PCS) * cp.sum(cp.multiply(smp_row, q_penalty)) * dt
+    # method=='none'은 q_penalty 자체가 없으므로 pcs_cost=0(파이썬 float - cvxpy Variable이
+    # 아니라도 아래 objective_expr의 '+ pcs_cost'는 상수 덧셈으로 그대로 유효하다).
+    pcs_cost = (float(C_PCS) * cp.sum(cp.multiply(smp_row, q_penalty)) * dt
+                if has_pcs_polygon else 0.0)
 
     dpp_terms = {}   # 진단용 - dpp_preserved=False일 때만 채워 stdout에 보고(_diagnose_dpp_terms)
 
@@ -685,6 +1656,12 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
         for m in range(M):
             loss_benefit = loss_benefit + cp.sum(cp.multiply(lhs_params[m], Q_seg[:, :, m]))
         loss_term = -loss_benefit * dt   # 비용에서 차감(이득)
+    elif method in ('none', 'pcs_only'):
+        # ★ 계측 추가 라운드 작업C-2: 기준1은 Q 자체가 없으니 손실항도 없고, 기준2는
+        # "손실 편익 항만 제거"가 정의이므로 loss_term=0 - 나머지(다각형/s_app/q_penalty/
+        # SOC/사이클 등식)는 위에서 이미 pwl/qp와 동일하게 만들어졌다(method=='pcs_only'는
+        # has_pcs_polygon=True라 그 블록을 그대로 통과했다 - 보고요청5).
+        loss_term = 0.0
     else:
         # ---- QP 전개형 (모듈 docstring "QP 전개" 절 - 3차 개정 신규) ----
         # dP_e/dQ_e: bus_onehot이 이제 상수(bus_idx가 주어졌으므로)라 계수가 파라미터를
@@ -729,10 +1706,11 @@ def _build_problem_proto(method, n, T, M=None, bus_idx=None):
         params['bus_onehot'] = bus_onehot
     if method == 'pwl':
         params['lhs'] = lhs_params
-    else:
+    elif method == 'qp':
         params['rsmp'] = rsmp_param
         params['cross_p'] = cross_p_param
         params['cross_q'] = cross_q_param
+    # 'none'/'pcs_only': 추가 Parameter 없음
 
     varset = dict(P_ch=P_ch, P_dis=P_dis, Q=Q, soc=soc, P_net=P_net,
                   s_app=s_app, q_penalty=q_penalty)
@@ -760,7 +1738,8 @@ def _diagnose_dpp_terms(entry):
         print(f'    {name}: is_dpp()={ok}', flush=True)
 
 
-def _set_params(entry, S, E, bus_idx, profile, smp, lhs_row_values=None, v_sq_line=None):
+def _set_params(entry, S, E, bus_idx, profile, smp, lhs_row_values=None, v_sq_line=None,
+                qe_base_ac_mvar=None, apply_qp_corrections=True):
     """entry(=_build_problem_proto 반환)의 Parameter들에 실제 값을 채운다.
     lower_lp._prepare_common을 그대로 재사용해 load_p_bus/load_q_bus를 만든다
     (읽기 전용 재사용 - lower_lp.py 원본 미수정). bus_onehot이 이미 상수로 구워진
@@ -791,11 +1770,17 @@ def _set_params(entry, S, E, bus_idx, profile, smp, lhs_row_values=None, v_sq_li
         # 이후 Parameter에 담기는 값은 원/(Mvar*h) 단위다.
         for m, param in enumerate(p['lhs']):
             param.value = lhs_row_values[m] * smp_arr[None, :]   # (1,T)*(T,) -> (1,T)
-    else:
+    elif entry['method'] == 'qp':
         # ---- QP 교차항 계수 (모듈 docstring "QP 전개" 절) - cvxpy 밖 numpy로 계산 ----
         D, r_pu = entry['D'], entry['r_pu']
         Pe_base = D @ (load_p_val / PM.S_BASE_MVA)   # (n_branch,T), 순수 numpy(변수 없음), pu
         Qe_base = D @ (load_q_val / PM.S_BASE_MVA)
+        if apply_qp_corrections and QP_QE_BASE_AC:
+            if qe_base_ac_mvar is None:
+                raise ValueError("QP_QE_BASE_AC=True인데 기저 AC q_from 조류가 전달되지 않았다.")
+            # pandapower q_from_mvar는 이 방사형 load-positive 상태에서 양수다. 진단용
+            # 부호 검산과 같은 관례로 절댓값을 취해 Baran-Wu Qe_base(부하양수)에 맞춘다.
+            Qe_base = np.abs(np.asarray(qe_base_ac_mvar, dtype=float)) / PM.S_BASE_MVA
         # ★ 4차 개정(QP 단위 수정) 버그 수정: dP_e/dQ_e는 S_BASE_MVA로 나눈 pu다
         # (P_net/S_BASE_MVA를 D로 매핑한 것). 따라서 r_pu*(dP_e^2+dQ_e^2)는 "pu 손실"
         # (무차원, S_BASE 기준 비율)이지 MW가 아니다 - SMP(원/MWh)와 곱해 원화를 만들려면
@@ -812,6 +1797,8 @@ def _set_params(entry, S, E, bus_idx, profile, smp, lhs_row_values=None, v_sq_li
         # 그대로 유지 - 보정 전/후 나란히 비교(지시서 B-4)를 위해 토글 가능하게 둔다.
         if QP_V2_CORRECTION and v_sq_line is not None:
             rsmp = rsmp / v_sq_line
+        if apply_qp_corrections and QP_GROSSUP:
+            rsmp = rsmp / float(QP_GROSSUP_ALPHA)
         p['rsmp'].value = rsmp
         p['cross_p'].value = -2.0 * rsmp * Pe_base
         p['cross_q'].value = -2.0 * rsmp * Qe_base
@@ -912,7 +1899,8 @@ def _compute_padding_stats(unit_p_ch, unit_p_dis):
 # 3) AVG_DAYS 스케줄 계산 (avg 전용 - peak은 3차에서 baselines['unit_p_zero']로 대체)
 # ============================================================
 
-def _compute_schedule(entry, S, E, bus, loss_table, scenarios, v_sq_line_table=None):
+def _compute_schedule(entry, S, E, bus, loss_table, scenarios, v_sq_line_table=None,
+                      ac_flow_table=None):
     """scenarios(PM.AVG_DAYS)를 프로토타입 LP로 풀어 unit_p/unit_q를 확정하고, 순수
     solve 시간(컴파일 제외)을 별도로 측정한다. v_sq_line_table이 주어지면(작업 B)
     method='qp'의 손실항에 그 시나리오의 기저 전압 제곱(branch, from-bus 기준)으로
@@ -922,12 +1910,13 @@ def _compute_schedule(entry, S, E, bus, loss_table, scenarios, v_sq_line_table=N
     N_TIMING_REPS(5)회 재-solve(컴파일 제외, 결과값은 버림) 후 **중앙값**을
     solve_time으로 보고한다. warmup_total(컴파일 포함 1회 총합)도 반환한다.
 
-    반환: unit_p, unit_q, solve_time_median, warmup_total, solver_names,
-    inaccurate_flags, pad_stats(검산 2-2, _compute_padding_stats 참조 - PAD_ABORT_MW
-    초과 시 여기서 AssertionError로 즉시 중단한다).
+    반환: unit_p, unit_q, schedule_aux, solve_time_median, warmup_total, solver_names,
+    inaccurate_flags, pad_stats. schedule_aux의 p_ch/p_dis/s_app/q_penalty는 모두 워밍업
+    solve 직후 복사한 확정값이며 타이밍 반복 결과가 아니다.
     """
     unit_p, unit_q = {}, {}
     unit_p_ch, unit_p_dis = {}, {}
+    unit_s_app, unit_q_penalty = {}, {}
     solver_names, inaccurate_flags = {}, {}
 
     def _set_and_solve(s):
@@ -937,7 +1926,13 @@ def _compute_schedule(entry, S, E, bus, loss_table, scenarios, v_sq_line_table=N
         if entry['method'] == 'pwl':
             lhs_rows = _lhs_rows_for(loss_table, bus, s, entry['M'])
         v_sq = v_sq_line_table[s] if (v_sq_line_table is not None) else None
-        _set_params(entry, S, E, [bus], profile, smp, lhs_row_values=lhs_rows, v_sq_line=v_sq)
+        qe_ac = None
+        if ac_flow_table is not None:
+            qe_ac = ac_flow_table[s]['q_from']
+        _set_params(
+            entry, S, E, [bus], profile, smp, lhs_row_values=lhs_rows, v_sq_line=v_sq,
+            qe_base_ac_mvar=qe_ac,
+        )
         return _solve_timed(entry)
 
     # ---- 워밍업: 컴파일 포함, 결과값 확정(.copy()로 이후 재-solve의 아리아싱 방지) ----
@@ -952,6 +1947,14 @@ def _compute_schedule(entry, S, E, bus, loss_table, scenarios, v_sq_line_table=N
         unit_q[s] = np.array(v['Q'].value, copy=True)
         unit_p_ch[s] = np.array(v['P_ch'].value, copy=True)
         unit_p_dis[s] = np.array(v['P_dis'].value, copy=True)
+        unit_s_app[s] = (
+            np.array(v['s_app'].value, copy=True) if v['s_app'] is not None
+            else np.full_like(unit_p[s], np.nan)
+        )
+        unit_q_penalty[s] = (
+            np.array(v['q_penalty'].value, copy=True) if v['q_penalty'] is not None
+            else np.zeros_like(unit_p[s])
+        )
 
     label = f"{entry['method']}/M={entry['M']}/bus={bus}"
     _assert_pcs_circle(unit_p, unit_q, np.atleast_1d(np.asarray(S, dtype=float)), label)
@@ -977,7 +1980,11 @@ def _compute_schedule(entry, S, E, bus, loss_table, scenarios, v_sq_line_table=N
         rep_totals.append(rep_total)
     solve_time_median = float(np.median(rep_totals))
 
-    return (unit_p, unit_q, solve_time_median, warmup_total, solver_names,
+    schedule_aux = dict(
+        p_ch=unit_p_ch, p_dis=unit_p_dis, s_app=unit_s_app,
+        q_penalty=unit_q_penalty,
+    )
+    return (unit_p, unit_q, schedule_aux, solve_time_median, warmup_total, solver_names,
             inaccurate_flags, pad_stats)
 
 
@@ -1156,7 +2163,8 @@ def _q_prediction_ratio_percentiles(pred_arr, actual_arr):
     return pct, n_excluded
 
 
-def _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table):
+def _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table,
+                               ac_flow_table, alpha_by_point):
     """★ 4차 개정(QP 단위 수정 라운드 + 작업 B): "Q=q_level에서 두 방식이 예측하는
     손실 저감량을 각각 출력해 실측 조류계산 값과 대조"한다(P3에서 QP/PWL 사용량이
     2.5배 갈린 원인이 QP 자신의 손실추정에 있는지 분리해서 보기 위함).
@@ -1177,15 +2185,20 @@ def _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table):
     idx0 = Q_BOUNDARY_POINTS.index(0.0)
     idxq = Q_BOUNDARY_POINTS.index(q_level)
     boundaries4 = SEGMENT_BOUNDARIES[4]
-    is_exact_boundary = q_level in boundaries4
+    boundaries9 = SEGMENT_BOUNDARIES[9]
+    is_exact_boundary4 = q_level in boundaries4
+    is_exact_boundary9 = q_level in boundaries9
     topo = lower_lp._get_topology()
     D, r_pu, n_bus = topo['D'], topo['r_pu'], topo['n_bus']
     bus_onehot_np = np.zeros((1, n_bus))
     bus_onehot_np[0, bus] = 1.0
     _base_load_p_bus, base_load_q_bus = lower_lp.base_load_bus_arrays()
 
-    actual_vals, pwl_vals = [], []
+    actual_vals, pwl_vals, pwl9_vals = [], [], []
     qp_uncorr_vals, qp_corr_vals = [], []
+    qp_ac_vals, qp_gross_vals, qp_both_vals = [], [], []
+    alpha = alpha_by_point[point['point_id']][q_level]
+    grossup = (1.0 / alpha) if np.isfinite(alpha) and alpha != 0.0 else np.nan
     for s in PM.AVG_DAYS:
         arr = loss_table[bus][s]   # (T, len(Q_BOUNDARY_POINTS)) - P_inj=0 고정으로 실측된 것
         profile = np.asarray(PM.LOAD[s], dtype=float)
@@ -1201,22 +2214,45 @@ def _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table):
         # 나눈다(추가 조류계산 없음 - _measure_loss_table이 이미 캐시한 값 재사용).
         v_sq = v_sq_line_table[s]   # (n_branch, T)
         qp_corr_t = (per_branch_uncorr / v_sq).sum(axis=0)
+        # 작업 4-3: ac_flow_table의 기저 송단 q_from_mvar를 절댓값 처리해
+        # Baran-Wu load-positive Qe_base와 맞춘다. 코드 위치:
+        # _diagnose_q_prediction_gap -> ac_flow_table[s]['q_from'].
+        Qe_base_ac = np.abs(ac_flow_table[s]['q_from']) / PM.S_BASE_MVA
+        per_branch_ac = (
+            r_pu[:, None] * (2.0 * Qe_base_ac * dQe - dQe ** 2) * PM.S_BASE_MVA
+        )
+        qp_ac_t = (per_branch_ac / v_sq).sum(axis=0)
+        qp_gross_t = qp_corr_t * grossup
+        qp_both_t = qp_ac_t * grossup
         for t in range(PM.TIME_STEPS):
             actual = float(arr[t, idx0] - arr[t, idxq])
             actual_vals.append(actual)
             pwl_vals.append(_pwl_predicted_reduction(arr[t], boundaries4, q_level))
+            pwl9_vals.append(_pwl_predicted_reduction(arr[t], boundaries9, q_level))
             qp_uncorr_vals.append(float(qp_uncorr_t[t]))
             qp_corr_vals.append(float(qp_corr_t[t]))
+            qp_ac_vals.append(float(qp_ac_t[t]))
+            qp_gross_vals.append(float(qp_gross_t[t]))
+            qp_both_vals.append(float(qp_both_t[t]))
 
     actual_arr = np.array(actual_vals)
     pwl_arr = np.array(pwl_vals)
+    pwl9_arr = np.array(pwl9_vals)
     qp_uncorr_arr = np.array(qp_uncorr_vals)
     qp_corr_arr = np.array(qp_corr_vals)
+    qp_ac_arr = np.array(qp_ac_vals)
+    qp_gross_arr = np.array(qp_gross_vals)
+    qp_both_arr = np.array(qp_both_vals)
     pwl_err = pwl_arr - actual_arr
+    pwl9_err = pwl9_arr - actual_arr
     qp_uncorr_err = qp_uncorr_arr - actual_arr
     qp_corr_err = qp_corr_arr - actual_arr
-    boundary_note = (
-        "텔레스코핑 항등식 - 0이 아니면 구현을 의심할 것" if is_exact_boundary
+    boundary_note4 = (
+        "텔레스코핑 항등식 - 0이 아니면 구현을 의심할 것" if is_exact_boundary4
+        else "경계 사이 - PWL 자신의 세그먼트 내 선형보간 오차(실측과 다를 수 있음, 정상)"
+    )
+    boundary_note9 = (
+        "텔레스코핑 항등식 - 0이 아니면 구현을 의심할 것" if is_exact_boundary9
         else "경계 사이 - PWL 자신의 세그먼트 내 선형보간 오차(실측과 다를 수 있음, 정상)"
     )
     print(f"  {point['point_id']}(bus={bus}) Q={q_level} 손실저감 예측 대조 "
@@ -1225,17 +2261,46 @@ def _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table):
           f"mean={np.mean(actual_arr):.6f} MW", flush=True)
     print(f"    PWL(M=4) 예측         : median={np.median(pwl_arr):.6f} MW  "
           f"실측 대비 오차 median={np.median(pwl_err):+.6f} MW, "
-          f"max|오차|={np.max(np.abs(pwl_err)):.6f} MW ({boundary_note})", flush=True)
+          f"max|오차|={np.max(np.abs(pwl_err)):.6f} MW ({boundary_note4})", flush=True)
+    print(f"    PWL(M=9) 예측         : median={np.median(pwl9_arr):.6f} MW  "
+          f"실측 대비 오차 median={np.median(pwl9_err):+.6f} MW, "
+          f"max|오차|={np.max(np.abs(pwl9_err)):.6f} MW ({boundary_note9})", flush=True)
     print(f"    QP 예측(보정 전,V=1)  : median={np.median(qp_uncorr_arr):.6f} MW  "
           f"실측 대비 오차 median={np.median(qp_uncorr_err):+.6f} MW, "
           f"max|오차|={np.max(np.abs(qp_uncorr_err)):.6f} MW", flush=True)
     print(f"    QP 예측(보정 후,V^2)  : median={np.median(qp_corr_arr):.6f} MW  "
           f"실측 대비 오차 median={np.median(qp_corr_err):+.6f} MW, "
           f"max|오차|={np.max(np.abs(qp_corr_err)):.6f} MW", flush=True)
+    print("    Qe_base AC 교체 규약: ac_flow_table[s]['q_from']의 절댓값 "
+          "([_diagnose_q_prediction_gap])", flush=True)
+    print(f"    그로스업: 이 실행·통제점·Q={q_level}의 median alpha=A/dLoss="
+          f"{alpha:.6f}, 1/alpha={grossup:.6f}", flush=True)
 
-    # ---- B-5: (예측/실측) 비의 분포 ----
-    for label, pred_arr in (('PWL', pwl_arr), ('QP(보정전)', qp_uncorr_arr),
-                              ('QP(보정후)', qp_corr_arr)):
+    # ---- 작업 4-2: 네 변형의 median 오차와 (예측/실측) 비 분포 ----
+    variants = (
+        ('(a) 현행[V^2]', qp_corr_arr),
+        ('(b) +Qe_base AC', qp_ac_arr),
+        ('(c) +grossup', qp_gross_arr),
+        ('(d) +Qe_base AC+grossup', qp_both_arr),
+    )
+    for label, pred_arr in variants:
+        err = pred_arr - actual_arr
+        print(f"    변형[{label}]: 예측 median={np.median(pred_arr):.6f} MW, "
+              f"실측 대비 median 오차={np.median(err):+.6f} MW", flush=True)
+        pct, n_excl = _q_prediction_ratio_percentiles(pred_arr, actual_arr)
+        if pct is None:
+            print(f"      비율분포: 전 표본 actual=0 - 비 정의 불가", flush=True)
+        else:
+            print(f"      비율분포(예측/실측, actual=0 {n_excl}건 제외): "
+                  f"min={pct[0]:.4f} p25={pct[1]:.4f} median={pct[2]:.4f} "
+                  f"p75={pct[3]:.4f} max={pct[4]:.4f}", flush=True)
+
+    # 기존 대조 출력도 보존한다.
+    report_rows = []
+    for label, pred_arr in (
+        ('PWL(M=4)', pwl_arr), ('PWL(M=9)', pwl9_arr),
+        ('QP(보정전)', qp_uncorr_arr),
+    ):
         pct, n_excl = _q_prediction_ratio_percentiles(pred_arr, actual_arr)
         if pct is None:
             print(f"    비율분포[{label}]: 전 표본 actual=0 - 비 정의 불가", flush=True)
@@ -1243,6 +2308,25 @@ def _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table):
             print(f"    비율분포[{label}](예측/실측, actual=0 {n_excl}건 제외): "
                   f"min={pct[0]:.4f} p25={pct[1]:.4f} median={pct[2]:.4f} "
                   f"p75={pct[3]:.4f} max={pct[4]:.4f}", flush=True)
+    for label, pred_arr in (
+        ('PWL(M=4)', pwl_arr), ('PWL(M=9)', pwl9_arr),
+        ('QP current', qp_corr_arr), ('QP +Qe_base AC', qp_ac_arr),
+        ('QP +grossup', qp_gross_arr), ('QP +both', qp_both_arr),
+    ):
+        pct, n_excl = _q_prediction_ratio_percentiles(pred_arr, actual_arr)
+        report_rows.append(dict(
+            point_id=point['point_id'], bus=bus, q_level=q_level, variant=label,
+            actual_median_mw=float(np.median(actual_arr)),
+            predicted_median_mw=float(np.median(pred_arr)),
+            error_median_mw=float(np.median(pred_arr - actual_arr)),
+            ratio_min=(float(pct[0]) if pct is not None else np.nan),
+            ratio_p25=(float(pct[1]) if pct is not None else np.nan),
+            ratio_median=(float(pct[2]) if pct is not None else np.nan),
+            ratio_p75=(float(pct[3]) if pct is not None else np.nan),
+            ratio_max=(float(pct[4]) if pct is not None else np.nan),
+            n_excluded=n_excl,
+        ))
+    return report_rows
 
 
 def _verify_q_zero_anchor(point):
@@ -1263,7 +2347,10 @@ def _verify_q_zero_anchor(point):
     # s_app/폴리곤 제약만의 구조적 성질이라 손실항(rsmp)의 V^2 보정 여부와 무관하게
     # 항상 성립해야 한다(Q=0으로 고정되면 loss_term의 크기와 무관하게 s_app이 |P_net|
     # 까지 내려가는 것이 최적이므로).
-    _set_params(entry, point['S'], point['E'], [bus], PM.LOAD[s], PM.SMP_PER_MWH[s])
+    _set_params(
+        entry, point['S'], point['E'], [bus], PM.LOAD[s], PM.SMP_PER_MWH[s],
+        apply_qp_corrections=False,
+    )
 
     q_zero_constraints = list(entry['problem'].constraints) + [entry['vars']['Q'] == 0]
     test_problem = cp.Problem(entry['problem'].objective, q_zero_constraints)
@@ -1291,6 +2378,7 @@ def _compute_point_baselines(point, qstar_full):
 
     j_net_a = detail_zero['j_net']
     unit_p = detail_zero['unit_p']   # dict[ALL_DAYS] -> (1,T)
+    unit_q_zero = detail_zero['unit_q']
     b_arr, S_arr, E_arr = detail_zero['b'], detail_zero['S'], detail_zero['E']
     bus = int(b_arr[0])
 
@@ -1298,22 +2386,117 @@ def _compute_point_baselines(point, qstar_full):
     result_c = _reinject_and_evaluate(b_arr, S_arr, E_arr, unit_p, unit_q_star)
     j_net_c = result_c['j_net'] if not result_c.get('diverged') else None
 
-    return dict(j_net_a=j_net_a, j_net_c=j_net_c, bus=bus, unit_p_zero=unit_p)
+    pcs_zero = {
+        s: C_PCS * (
+            np.sqrt(np.asarray(unit_p[s]) ** 2 + np.asarray(unit_q_zero[s]) ** 2)
+            - np.abs(np.asarray(unit_p[s]))
+        ) for s in PM.ALL_DAYS
+    }
+    loss_line_zero = {
+        s: np.asarray(detail_zero['loss_ess'][s])
+        - np.asarray(pcs_zero[s]).sum(axis=0)
+        for s in PM.ALL_DAYS
+    }
+    return dict(
+        j_net_a=j_net_a, j_net_c=j_net_c, bus=bus, unit_p_zero=unit_p,
+        unit_q_zero=unit_q_zero, loss_line_zero=loss_line_zero,
+        b_energy_a=detail_zero['b_energy'],
+    )
 
 
 # ============================================================
 # 5) 통제점 x 방식 1회 처리 (AVG_DAYS만 LP로 풀고, PEAK_DAYS는 baselines 재사용)
 # ============================================================
 
-def _process(point, method, M, avg_entry, loss_table, qstar_full, baselines, v_sq_line_table):
+def _reinject_and_capture_line_loss(b, S, E, unit_p, unit_q):
+    """기존 AC 평가의 조류계산을 그대로 쓰면서 성공한 각 시각의 선로손실만 읽는다."""
+    original_run_pf = evaluate._run_pf_with_retry
+    captured = []
+
+    def _wrapped_run_pf(net, *args, **kwargs):
+        ok = original_run_pf(net, *args, **kwargs)
+        if ok:
+            captured.append(float(net.res_line.pl_mw.sum()))
+        return ok
+
+    evaluate._run_pf_with_retry = _wrapped_run_pf
+    try:
+        result = _reinject_and_evaluate(b, S, E, unit_p, unit_q)
+    finally:
+        evaluate._run_pf_with_retry = original_run_pf
+
+    line_loss = {}
+    offset = 0
+    for s in PM.ALL_DAYS:
+        line_loss[s] = np.asarray(captured[offset:offset + PM.TIME_STEPS], dtype=float)
+        offset += PM.TIME_STEPS
+    return result, line_loss
+
+
+def _annual_schedule_components(unit_p, unit_q, loss_line_ess, b_energy_value,
+                                loss_table, bus, schedule_aux=None):
+    """작업 2의 연간 원장. (5)는 AC 평가에서 캡처한 실제 선로손실을 직접 쓴다."""
+    arb_proxy = q_loss_measured = pcs_true_cost = pcs_charged_cost = 0.0
+    actual_line_loss_reduction = 0.0
+    base_flow = evaluate._get_base_flow()
+    for s in PM.AVG_DAYS:
+        smp = np.asarray(PM.SMP_PER_MWH[s], dtype=float)
+        weight = float(PM.N_WEEKDAYS[s]) * PM.DT_HOURS
+        p_net = np.asarray(unit_p[s], dtype=float).sum(axis=0)
+        q_units = np.asarray(unit_q[s], dtype=float)
+        pcs_true_units = C_PCS * (
+            np.sqrt(np.asarray(unit_p[s]) ** 2 + q_units ** 2)
+            - np.abs(np.asarray(unit_p[s]))
+        )
+        pcs_true = pcs_true_units.sum(axis=0)
+        if schedule_aux is not None:
+            pcs_charged = C_PCS * np.asarray(
+                schedule_aux['q_penalty'][s], dtype=float
+            ).sum(axis=0)
+        else:
+            pcs_charged = np.zeros(PM.TIME_STEPS)
+
+        arr = loss_table[bus][s]
+        measured_reduction = np.array([
+            np.interp(q_units[0, t], Q_BOUNDARY_POINTS, arr[t, 0] - arr[t, :])
+            for t in range(PM.TIME_STEPS)
+        ])
+        arb_proxy += float(np.sum(smp * p_net)) * weight
+        q_loss_measured += float(np.sum(smp * measured_reduction)) * weight
+        pcs_true_cost += float(np.sum(smp * pcs_true)) * weight
+        pcs_charged_cost += float(np.sum(smp * pcs_charged)) * weight
+        actual_line_loss_reduction += float(np.sum(
+            smp * (np.asarray(base_flow['loss'][s]) - np.asarray(loss_line_ess[s]))
+        )) * weight
+
+    ledger_rhs = arb_proxy - pcs_true_cost + actual_line_loss_reduction
+    return dict(
+        arb_proxy=arb_proxy,
+        q_loss_measured=q_loss_measured,
+        pcs_true_cost=pcs_true_cost,
+        pcs_charged_cost=pcs_charged_cost,
+        actual_line_loss_reduction=actual_line_loss_reduction,
+        b_energy=b_energy_value,
+        ledger_rhs=ledger_rhs,
+        ledger_residual=b_energy_value - ledger_rhs,
+        actual_minus_p0=actual_line_loss_reduction - q_loss_measured,
+        net_true=arb_proxy + q_loss_measured - pcs_true_cost,
+        pcs_gap=pcs_true_cost - pcs_charged_cost,
+    )
+
+
+def _process(point, method, M, avg_entry, loss_table, qstar_full, baselines, v_sq_line_table,
+             ac_flow_table=None):
     S, E, bus = point['S'], point['E'], point['b']
     b_arr = np.array([bus], dtype=float)
     S_arr = np.array([S], dtype=float)
     E_arr = np.array([E], dtype=float)
 
-    (unit_p_avg, unit_q_avg, solve_time_median, warmup_total, solvers_avg, inacc_avg,
-     pad_stats) = _compute_schedule(avg_entry, S, E, bus, loss_table, PM.AVG_DAYS,
-                                     v_sq_line_table=v_sq_line_table)
+    (unit_p_avg, unit_q_avg, schedule_aux, solve_time_median, warmup_total, solvers_avg,
+     inacc_avg, pad_stats) = _compute_schedule(
+        avg_entry, S, E, bus, loss_table, PM.AVG_DAYS,
+        v_sq_line_table=v_sq_line_table, ac_flow_table=ac_flow_table,
+    )
 
     # ---- PEAK_DAYS: 3차 개정 통제 설계 - force_q_zero=True LP의 P를 그대로, Q=0 ----
     unit_p_zero = baselines['unit_p_zero']
@@ -1322,7 +2505,9 @@ def _process(point, method, M, avg_entry, loss_table, qstar_full, baselines, v_s
     for s in PM.PEAK_DAYS:   # 방어적 점검 - 위 construct가 실제로 Q=0을 만들었는지
         assert np.all(unit_q_lp[s] == 0.0), f'{point["point_id"]}/{s}: PEAK Q가 0이 아님(버그)'
 
-    result_b = _reinject_and_evaluate(b_arr, S_arr, E_arr, unit_p_lp, unit_q_lp)
+    result_b, loss_line_b = _reinject_and_capture_line_loss(
+        b_arr, S_arr, E_arr, unit_p_lp, unit_q_lp
+    )
     j_net_b = result_b['j_net'] if not result_b.get('diverged') else None
 
     j_net_a = baselines['j_net_a']
@@ -1341,6 +2526,13 @@ def _process(point, method, M, avg_entry, loss_table, qstar_full, baselines, v_s
     for s in PM.AVG_DAYS:
         for t in range(PM.TIME_STEPS):
             q_lp = float(unit_q_lp[s][0, t])
+            p_ch = float(schedule_aux['p_ch'][s][0, t])
+            p_dis = float(schedule_aux['p_dis'][s][0, t])
+            p_net = p_dis - p_ch
+            s_app = float(schedule_aux['s_app'][s][0, t])
+            q_penalty = float(schedule_aux['q_penalty'][s][0, t])
+            pcs_true = C_PCS * (np.hypot(p_net, q_lp) - abs(p_net))
+            pcs_charged = C_PCS * q_penalty
             key = (point['point_id'], s, t)
             q_star = qstar_full.get(key)
             if q_star is None:
@@ -1366,8 +2558,14 @@ def _process(point, method, M, avg_entry, loss_table, qstar_full, baselines, v_s
                 max_pad_unit=(pad_loc[2] if pad_loc else ''),
                 max_pad_annual_won_implied=pad_stats['annual_won_implied'],
                 qp_v2_correction=QP_V2_CORRECTION,
+                p_ch=p_ch, p_dis=p_dis, p_net=p_net, s_app=s_app,
+                q_penalty=q_penalty, pcs_true=pcs_true, pcs_charged=pcs_charged,
             ))
 
+    annual_components = _annual_schedule_components(
+        unit_p_lp, unit_q_lp, loss_line_b, result_b['b_energy'],
+        loss_table, bus, schedule_aux=schedule_aux,
+    )
     unit_q_star = _build_qstar_unit_q(point['point_id'], qstar_full)
     n_avg_lp, sum_avg_lp = _group_stats(unit_q_lp, PM.AVG_DAYS)
     n_avg_star, sum_avg_star = _group_stats(unit_q_star, PM.AVG_DAYS)
@@ -1381,8 +2579,35 @@ def _process(point, method, M, avg_entry, loss_table, qstar_full, baselines, v_s
         dpp_preserved_avg=avg_entry['dpp_preserved'],
         solvers_avg=solvers_avg, inaccurate_avg=inacc_avg,
         q_avg_lp=(n_avg_lp, sum_avg_lp), q_avg_star=(n_avg_star, sum_avg_star),
-        free_zone=free_zone, pad_stats=pad_stats,
+        free_zone=free_zone, pad_stats=pad_stats, annual_components=annual_components,
     )
+
+
+# ============================================================
+# 계측 추가 라운드 - 작업 C: 기준시간 측정 (현행 LP와의 apples-to-apples 비교)
+# ============================================================
+
+def _measure_baseline_timing(label, entry, loss_table):
+    """지시서 작업C-2/C-3: 현재 방식들과 **완전히 동일한 타이밍 하네스**(_compute_schedule -
+    워밍업 1회 후 N_TIMING_REPS회 반복, 컴파일 제외, 중앙값)로 기준 구성 하나를 3개
+    통제점 전부에 대해 측정한다. loss_table을 받지만 method='none'/'pcs_only'는 그 안의
+    lhs 관련 로직을 타지 않으므로(_compute_schedule/_set_params가 method=='pwl'일 때만
+    사용) 실질적으로 쓰이지 않는다 - 하네스를 다른 방식과 동일하게 유지하기 위해
+    시그니처만 맞춘다. 판정 없음 - 수치만."""
+    section(f'기준 측정: {label}')
+    print(f"DPP 유지: {entry['dpp_preserved']}", flush=True)
+    times = {}
+    for point in POINTS:
+        S, E, bus = point['S'], point['E'], point['b']
+        (_up, _uq, _aux, solve_time_median, warmup_total, _sn, _inf,
+         _pad) = _compute_schedule(
+            entry, S, E, bus, loss_table, PM.AVG_DAYS
+        )
+        times[point['point_id']] = solve_time_median
+        print(f"  {point['point_id']}: solve_time(median, {N_TIMING_REPS}회, 컴파일 제외)="
+              f"{solve_time_median:.4f}초, warmup(컴파일 포함,1회)={warmup_total:.4f}초",
+              flush=True)
+    return times
 
 
 # ============================================================
@@ -1394,7 +2619,7 @@ def _fmt_won(v):
 
 
 def _print_method_summary(method, M, per_point_outcomes, avg_entries_for_diag,
-                           pwl_build_time, qp_build_times):
+                           pwl_build_time, qp_build_times, baseline1_times):
     label = f"{method.upper()}" + (f" M={M}" if M is not None else "")
     section(f'방식 {label}')
 
@@ -1413,13 +2638,17 @@ def _print_method_summary(method, M, per_point_outcomes, avg_entries_for_diag,
               "DPP가 유지되므로, 3포인트 공유가 불가능하다):", flush=True)
         for pid, bt in qp_build_times.items():
             print(f"  {pid}: {bt:.4f}초", flush=True)
-        print("  ★ 실배포 함의: lower_lp.py의 현재 캐싱 철학(build once per (kind,n,"
-              "force_q_zero,...), 이후 Parameter만 갱신)은 bus가 Parameter라는 전제 위에 "
-              "있다. QP를 그대로 채택하면 PSO가 매 입자마다 던지는(서로 다를 수 있는) "
-              "버스마다 이 빌드비용을 반복 지불해야 한다 - 위 값 x 입자수(32) x 세대수(100)"
-              " x run수(30) 규모(본실험)에서 지배적 병목이 될 수 있다. PWL은 bus가 "
-              "Parameter로 남아 이 비용이 없다 - QP 채택 여부를 정확도만으로 판단하지 말고 "
-              "이 구조적 비용차이도 반드시 함께 볼 것.", flush=True)
+        # ★ 작업E(계측 추가 라운드): 아래 문구는 이전 버전(0.022~0.030초 빌드시간을 전제로
+        # "지배적 병목이 될 수 있다"는 판정성 결론)을 수정한 것이다 - 직전 실행 실측
+        # 빌드시간은 P2 0.0093초/P3 0.0094초(P1의 0.0646초는 첫 빌드라 콜드스타트 포함)로
+        # 훨씬 작았고, 판정에 쓰인 "입자수x세대수x run수" 외삽도 버스 정의역이 1~32
+        # 32개뿐이라는 사실(워커당 32개 사전 빌드 캐시가 가능 - 32x0.0093=~0.30초 일회성)을
+        # 반영하지 않은 채였다. 코드에 박아 둔 판정 문구는 근거 수치가 바뀌어도 자동으로
+        # 갱신되지 않는다 - 이것이 이 스크립트가 stdout에 판정성 문장을 넣지 않는 이유의
+        # 실례다(모듈 docstring 참조).
+        print("  QP는 bus를 build-time 상수로 굽기 때문에 버스마다 Problem을 새로 지어야 "
+              "한다. 측정된 빌드 시간은 위와 같다. 버스 정의역의 크기와 캐싱 전략에 따라 "
+              "실배포 비용이 달라지므로, 이 수치를 근거로 사용자가 판단한다.", flush=True)
 
     all_abs_errs = []
     signed_errs = []
@@ -1441,6 +2670,20 @@ def _print_method_summary(method, M, per_point_outcomes, avg_entries_for_diag,
         print(f"    q_lp(AVG_DAYS) 분포: {n_avg}시각/{sum_avg:.3f} Mvar  vs  "
               f"q_star(AVG_DAYS): {n_star}시각/{sum_star:.3f} Mvar", flush=True)
 
+        annual = outcome['annual_components']
+        print("    연간 원화 계측 (가중: PM.AVG_DAYS, PM.N_WEEKDAYS, "
+              "PM.SMP_PER_MWH, PM.DT_HOURS):", flush=True)
+        print(f"      (1) 차익 대리={annual['arb_proxy']:,.2f}원  "
+              f"(3) 실제 PCS 비용={annual['pcs_true_cost']:,.2f}원", flush=True)
+        print(f"      (5) 실제 총 선로손실 저감={annual['actual_line_loss_reduction']:,.2f}원  "
+              f"(6) b_energy={annual['b_energy']:,.2f}원", flush=True)
+        print(f"      (1)-(3)+(5)={annual['ledger_rhs']:,.2f}원  "
+              f"(6)-[(1)-(3)+(5)]={annual['ledger_residual']:+.6f}원", flush=True)
+        print(f"      (2) P_inj=0 loss_table Q 손실저감={annual['q_loss_measured']:,.2f}원  "
+              f"(5)-(2)={annual['actual_minus_p0']:+,.2f}원", flush=True)
+        print(f"      (4) LP 계상 PCS 비용={annual['pcs_charged_cost']:,.2f}원  "
+              f"(3)-(4)={annual['pcs_gap']:+,.2f}원", flush=True)
+
         fz = outcome['free_zone']
         print(f"    무료구간(지시서 2-5, 작업C 필터수정): 폭={fz['free_zone_width']:.6f} Mvar, "
               f"최대미계상피상전력={fz['max_uncounted_loss']:.6f} MVA, "
@@ -1458,9 +2701,16 @@ def _print_method_summary(method, M, per_point_outcomes, avg_entries_for_diag,
 
         ratio = (outcome['warmup_time_avg'] / outcome['solve_time_avg']
                  if outcome['solve_time_avg'] > 0 else float('nan'))
+        # ★ 계측 추가 라운드 작업C-3: 배율의 기준을 REFERENCE_SOLVE_TIME_SEC(다른 머신·다른
+        # 범위 참고값, 아래 실행 메타에서 1회만 별도 표시)에서 기준1(force_q_zero=True 등가,
+        # 이 스크립트·같은 통제점·같은 하네스로 실측)로 교체했다 - 지시서 C-1/C-3 근거.
+        b1 = baseline1_times.get(point['point_id']) if baseline1_times else None
+        if b1 and b1 > 0:
+            ratio_label = f"{outcome['solve_time_avg'] / b1:.2f}x 기준1[force_q_zero=True 등가]"
+        else:
+            ratio_label = "기준1 값 없음"
         print(f"    solve_time(avg, 컴파일 제외, {N_TIMING_REPS}회 중앙값)="
-              f"{outcome['solve_time_avg']:.4f}초 "
-              f"({outcome['solve_time_avg'] / REFERENCE_SOLVE_TIME_SEC:.2f}x 기준값), "
+              f"{outcome['solve_time_avg']:.4f}초 ({ratio_label}), "
               f"warmup(컴파일 포함, 1회)={outcome['warmup_time_avg']:.4f}초 "
               f"(warmup/median={ratio:.2f}x)", flush=True)
 
@@ -1556,6 +2806,118 @@ def _make_path():
     return os.path.join(RESULTS_DIR, f'probe_lp_loss_proto_{hostname}_{ts}.csv')
 
 
+def _alpha_path(main_csv_path):
+    stem, ext = os.path.splitext(main_csv_path)
+    return f'{stem}_alpha{ext}'
+
+
+def _alpha_raw_path(main_csv_path):
+    stem, ext = os.path.splitext(main_csv_path)
+    return f'{stem}_alpha_raw{ext}'
+
+
+def _report_path(main_csv_path):
+    stem, _ext = os.path.splitext(main_csv_path)
+    return f'{stem}_report.md'
+
+
+def _md_num(value, digits=6):
+    if value is None:
+        return 'N/A'
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(value):
+        return str(value)
+    return f'{value:.{digits}f}'
+
+
+def _write_numeric_report(path, metadata, timings, alpha_constant_rows,
+                          baseline_rows, method_rows, prediction_rows, alpha_rows):
+    """이번 지시의 핵심 stdout 수치만 Markdown 표로 복제한다. 판정·해석 문장은 넣지 않는다."""
+    lines = ['# probe_lp_loss_proto numeric report', '']
+    lines += ['## Metadata', '', '| key | value |', '|---|---:|']
+    for key, value in metadata:
+        lines.append(f'| {key} | {value} |')
+
+    lines += ['', '## Timing and calls', '',
+              '| item | expected_calls | actual_calls | wall_time_sec | sec_per_call |',
+              '|---|---:|---:|---:|---:|']
+    for row in timings:
+        lines.append(
+            f"| {row['item']} | {_md_num(row.get('expected_calls'))} | "
+            f"{_md_num(row.get('actual_calls'))} | {_md_num(row.get('wall_time_sec'))} | "
+            f"{_md_num(row.get('sec_per_call'))} |"
+        )
+
+    lines += ['', '## Gross-up alpha', '',
+              '| point | measured_alpha | QP_GROSSUP_ALPHA | difference |',
+              '|---|---:|---:|---:|']
+    for row in alpha_constant_rows:
+        lines.append(
+            f"| {row['point_id']} | {_md_num(row['measured_alpha'])} | "
+            f"{_md_num(QP_GROSSUP_ALPHA)} | {_md_num(row['difference'])} |"
+        )
+
+    def _ledger_table(title, rows):
+        lines.extend([
+            '', f'## {title}', '',
+            '| label | point | j_net_a | j_net_b | j_net_c | q_hours | q_sum_mvar | solve_time_sec | '
+            'dpp | (1) arb | (3) pcs | (5) line_loss | (6) b_energy | residual | (2) p0_q_loss | (5)-(2) |',
+            '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
+        ])
+        for row in rows:
+            lines.append(
+                f"| {row['label']} | {row['point_id']} | {_md_num(row.get('j_net_a'), 2)} | "
+                f"{_md_num(row.get('j_net_b'), 2)} | {_md_num(row.get('j_net_c'), 2)} | "
+                f"{_md_num(row.get('q_hours'))} | "
+                f"{_md_num(row.get('q_sum_mvar'))} | {_md_num(row.get('solve_time_sec'))} | "
+                f"{_md_num(row.get('dpp'))} | {_md_num(row['arb_proxy'], 2)} | "
+                f"{_md_num(row['pcs_true_cost'], 2)} | "
+                f"{_md_num(row['actual_line_loss_reduction'], 2)} | "
+                f"{_md_num(row['b_energy'], 2)} | {_md_num(row['ledger_residual'])} | "
+                f"{_md_num(row['q_loss_measured'], 2)} | "
+                f"{_md_num(row['actual_minus_p0'], 2)} |"
+            )
+
+    _ledger_table('Baseline (a)', baseline_rows)
+    _ledger_table('Methods', method_rows)
+
+    lines += ['', '## Loss prediction', '',
+              '| point | q | variant | actual_median_mw | predicted_median_mw | '
+              'error_median_mw | ratio_min | ratio_p25 | ratio_median | ratio_p75 | ratio_max |',
+              '|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+    for row in prediction_rows:
+        lines.append(
+            f"| {row['point_id']} | {_md_num(row['q_level'], 4)} | {row['variant']} | "
+            f"{_md_num(row['actual_median_mw'])} | {_md_num(row['predicted_median_mw'])} | "
+            f"{_md_num(row['error_median_mw'])} | {_md_num(row['ratio_min'])} | "
+            f"{_md_num(row['ratio_p25'])} | {_md_num(row['ratio_median'])} | "
+            f"{_md_num(row['ratio_p75'])} | {_md_num(row['ratio_max'])} |"
+        )
+
+    lines += ['', '## Alpha P-Q sweep', '',
+              '| point | p | q | feasible | alpha_median | dloss_ratio_to_p0_median | identity_max_mw |',
+              '|---|---:|---:|---:|---:|---:|---:|']
+    for row in alpha_rows:
+        lines.append(
+            f"| {row['point_id']} | {_md_num(row['p_level'])} | {_md_num(row['q_level'], 4)} | "
+            f"{row['feasible']} | {_md_num(row['alpha_median'])} | "
+            f"{_md_num(row['dloss_ratio_to_p0_median'])} | "
+            f"{_md_num(row['identity_abs_max_mw'], 9)} |"
+        )
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f"핵심 수치 Markdown 저장: {path}", flush=True)
+
+
 def _open_csv_writer(path):
     """★ 작업 A-5: CSV를 한 번에 다 쓰지 않고 파일을 실행 내내 열어 둔 채 조합이
     끝날 때마다 즉시 append+flush한다(아래 _append_rows) - 어느 조합에서
@@ -1586,8 +2948,30 @@ if __name__ == '__main__':
     print(f"실행 시작={run_started_at.isoformat()}  호스트={hostname}", flush=True)
     print(f"POLY_N={PM.POLY_N}  S_BASE_MVA={PM.S_BASE_MVA}  ETA_PCS={PM.ETA_PCS}  "
           f"C_PCS={C_PCS:.6f}  Q_DIAG_LEVELS={Q_DIAG_LEVELS}", flush=True)
-    print(f"QP_V2_CORRECTION={QP_V2_CORRECTION}  PAD_WARN_MW={PAD_WARN_MW}  "
-          f"PAD_ABORT_MW={PAD_ABORT_MW}", flush=True)
+    print(f"Q_BOUNDARY_POINTS={Q_BOUNDARY_POINTS}", flush=True)
+    # ---- 작업 지시(9차세션) 참고 항목: POLY_N 변경과 함께 자동으로 바뀌는 값들이
+    # 실제로 새 POLY_N을 반영해 나오는지 확인용(free_zone_width는 _compute_free_zone_stats와
+    # 동일 공식 - S*sin(pi/POLY_N), 통제점별 S는 POINTS에서 그대로 가져온다) ----
+    print(f"PCS_FACET_THRESHOLD={PCS_FACET_THRESHOLD:.6f}", flush=True)
+    for _point in POINTS:
+        _fzw = float(_point['S']) * np.sin(np.pi / PM.POLY_N)
+        print(f"  free_zone_width[{_point['point_id']}](S={_point['S']}) = {_fzw:.6f} Mvar",
+              flush=True)
+    print(f"QP_V2_CORRECTION={QP_V2_CORRECTION}  QP_QE_BASE_AC={QP_QE_BASE_AC}  "
+          f"QP_GROSSUP={QP_GROSSUP}  QP_GROSSUP_ALPHA={QP_GROSSUP_ALPHA}", flush=True)
+    print("QP Qe_base AC source=_measure_loss_table의 q=0 기저 패스 "
+          "ac_flow_table[scenario]['q_from']; sign=abs(q_from_mvar); "
+          "optimization use=_compute_schedule->_set_params; 추가 조류계산=0", flush=True)
+    print(f"PAD_WARN_MW={PAD_WARN_MW}  PAD_ABORT_MW={PAD_ABORT_MW}", flush=True)
+    # ★ 계측 추가 라운드 작업C-4: 머신 간 비교용(추가 의존성 없이 얻을 수 있는 범위).
+    print(f"CPU={platform.processor()}  논리코어수={os.cpu_count()}  "
+          f"플랫폼={platform.platform()}", flush=True)
+    # ★ 계측 추가 라운드 작업C-1/C-3: 이 값은 더 이상 solve_time 배율의 기준이 아니다
+    # (다른 머신·다른 범위의 참고값일 뿐 - 상수 정의부 주석 참조). 배율은 아래 "기준
+    # 측정: force_q_zero=True 등가"로 이 실행 안에서 새로 잰 값을 쓴다.
+    print(f"REFERENCE_SOLVE_TIME_SEC={REFERENCE_SOLVE_TIME_SEC} (참고용 - 다른 머신·다른 "
+          "범위(evaluate 전체)에서 측정된 값, solve_time 배율의 기준으로 쓰지 않는다)",
+          flush=True)
 
     selective_path = _find_latest_csv('probe_q_selective')
     if selective_path is None:
@@ -1617,28 +3001,139 @@ if __name__ == '__main__':
         print(f"  {point['point_id']} (bus={b['bus']}): j_net(a)={_fmt_won(b['j_net_a'])}, "
               f"j_net(c)={_fmt_won(b['j_net_c'])}", flush=True)
 
-    section('손실 테이블 실측 (전 32버스 x AVG_DAYS 3개 x 24시간 x 경계점 8개 '
-            '+ 작업B: 기저 from-bus 전압^2 캐시, 추가 조류계산 없음)')
-    loss_table, v_sq_line_table = _measure_loss_table(net, base_p, base_q)
+    section(f'손실 테이블 실측 (전 32버스 x AVG_DAYS 3개 x 24시간 x 경계점 '
+            f'{len(Q_BOUNDARY_POINTS)}개 '
+            '+ 작업B: 기저 from-bus 전압^2/AC조류 캐시 + 작업A-1: 통제점 3개 전 q지점 '
+            '전체상태 캐시, 추가 조류계산 없음)')
+    # ---- 작업 지시(9차세션) 작업2: 벽시계 시간 + 실측 pp.runpp 호출횟수 계측
+    # (계측 범위는 _measure_loss_table 호출 전후로만 한정 - 연산 순서 불변, 값 미변경) ----
+    with _count_runpp_calls() as _runpp_counter:
+        _loss_table_t0 = time.perf_counter()
+        loss_table, v_sq_line_table, ac_flow_table, v_bus_table, ac_full_table = _measure_loss_table(
+            net, base_p, base_q
+        )
+        loss_table_wall_time_sec = time.perf_counter() - _loss_table_t0
+    loss_table_n_runpp_calls = _runpp_counter['n']
+    loss_table_expected_calls = (
+        len(ALL_BUSES) * len(PM.AVG_DAYS) * PM.TIME_STEPS * len(Q_BOUNDARY_POINTS)
+    )
+    loss_table_sec_per_call = (loss_table_wall_time_sec / loss_table_n_runpp_calls
+                                if loss_table_n_runpp_calls > 0 else float('nan'))
+    print(f"loss_table 벽시계 시간(초) = {loss_table_wall_time_sec:.6f}", flush=True)
+    print(f"loss_table 예상 격자 호출 횟수 = {loss_table_expected_calls}", flush=True)
+    print(f"loss_table 실측 pp.runpp 호출 횟수 = {loss_table_n_runpp_calls}", flush=True)
+    print(f"loss_table 회당 시간(초) = {loss_table_sec_per_call:.6f}", flush=True)
+    print("사실: 아래 연간 Q 손실저감 계측은 P_inj=0에서 실측한 loss_table을 사용한다. "
+          "P!=0 실제 급전점과의 차이는 별도 alpha P×Q 스윕이 계측한다.", flush=True)
 
     _print_pwl_monotonicity_check(loss_table)
 
+    # ---- 계측 추가 라운드(1차분): 작업 A (세그먼트 기울기 실측 노출) ----
+    _print_pwl_segment_slopes(loss_table)
+    _write_lhs_csv(_make_lhs_path(), loss_table)
+
+    # ---- 계측 추가 라운드(1차분): 작업 B (Qe_base vs AC 실측 조류 대조) ----
+    topo = lower_lp._get_topology()
+    _print_sign_convention_check(ac_flow_table, topo)
+    _print_qe_base_ac_comparison(ac_flow_table, topo)
+
+    # ---- 계측 추가 라운드(1차분): 작업 C (손실공식·전압규약 항등성 검증) ----
+    _print_loss_formula_identity_check(ac_flow_table, v_bus_table, net)
+
+    # ---- 계측 추가 라운드(2차분): 작업 A-2/A-3/A-4 (AC 되먹임 성분 분해) ----
+    _print_ac_feedback_decomposition(ac_full_table, loss_table, v_sq_line_table, net)
+    _print_dqe_ratio(ac_full_table)
+    alpha_by_point = _alpha_by_point_and_level(ac_full_table, loss_table, net)
+    alpha_constant_rows = []
+    section('QP_GROSSUP_ALPHA 실행 중 실측 대조')
+    for point in POINTS:
+        pid = point['point_id']
+        measured_alpha = alpha_by_point[pid]['pooled']
+        difference = measured_alpha - QP_GROSSUP_ALPHA
+        alpha_constant_rows.append(dict(
+            point_id=pid, measured_alpha=measured_alpha, difference=difference,
+        ))
+        print(f"  {pid}: measured_alpha={measured_alpha:.6f}  "
+              f"QP_GROSSUP_ALPHA={QP_GROSSUP_ALPHA:.6f}  "
+              f"difference={difference:+.6f}", flush=True)
+
+    baseline_report_rows = []
+    section('기준 (a:Q=0) 연간 원장')
+    for point in POINTS:
+        baseline = baselines_by_point[point['point_id']]
+        if baseline['unit_p_zero'] is None:
+            continue
+        ledger_a = _annual_schedule_components(
+            baseline['unit_p_zero'], baseline['unit_q_zero'],
+            baseline['loss_line_zero'], baseline['b_energy_a'],
+            loss_table, int(point['b']),
+        )
+        baseline['ledger_a'] = ledger_a
+        print(f"  {point['point_id']}: (1)={ledger_a['arb_proxy']:,.2f}원  "
+              f"(3)={ledger_a['pcs_true_cost']:,.2f}원  "
+              f"(5)={ledger_a['actual_line_loss_reduction']:,.2f}원  "
+              f"(6)={ledger_a['b_energy']:,.2f}원", flush=True)
+        print(f"    (1)-(3)+(5)={ledger_a['ledger_rhs']:,.2f}원  "
+              f"잔차={ledger_a['ledger_residual']:+.6f}원  "
+              f"(2)={ledger_a['q_loss_measured']:,.2f}원  "
+              f"(5)-(2)={ledger_a['actual_minus_p0']:+,.2f}원", flush=True)
+        baseline_report_rows.append(dict(
+            label='a', point_id=point['point_id'], j_net_a=baseline['j_net_a'],
+            j_net_b=baseline['j_net_a'], j_net_c=baseline['j_net_c'],
+            q_hours=0, q_sum_mvar=0.0,
+            solve_time_sec=None, dpp=None, **ledger_a,
+        ))
+
+    # ---- 계측·진단 라운드 작업 3: 기존 P_inj=0 테이블과 분리된 P×Q 스윕 ----
+    csv_path = _make_path()
+    with _count_runpp_calls() as _alpha_runpp_counter:
+        _alpha_t0 = time.perf_counter()
+        alpha_rows, alpha_raw_rows, alpha_expected_calls = _measure_alpha_p_sweep(
+            net, base_p, base_q
+        )
+        alpha_wall_time_sec = time.perf_counter() - _alpha_t0
+    alpha_actual_calls = _alpha_runpp_counter['n']
+    alpha_sec_per_call = (
+        alpha_wall_time_sec / alpha_actual_calls if alpha_actual_calls > 0 else float('nan')
+    )
+    print(f"alpha P×Q 예상 격자 호출 횟수={alpha_expected_calls}", flush=True)
+    print(f"alpha P×Q 실측 pp.runpp 호출 횟수={alpha_actual_calls}", flush=True)
+    print(f"alpha P×Q 벽시계 시간(초)={alpha_wall_time_sec:.6f}", flush=True)
+    print(f"alpha P×Q 회당 시간(초)={alpha_sec_per_call:.6f}", flush=True)
+    _write_alpha_csv(_alpha_path(csv_path), alpha_rows)
+    _write_alpha_raw_csv(_alpha_raw_path(csv_path), alpha_raw_rows)
+
     section('Q 수준 고정 손실저감 예측 대조 (PWL 텔레스코핑/보간 vs QP 근사 보정전/후, 지시서 요구)')
+    prediction_report_rows = []
     for q_level in Q_DIAG_LEVELS:
         print(f"\n  -- Q={q_level} --", flush=True)
         for point in POINTS:
             if baselines_by_point[point['point_id']]['unit_p_zero'] is None:
                 continue
-            _diagnose_q_prediction_gap(point, loss_table, q_level, v_sq_line_table)
+            prediction_report_rows.extend(_diagnose_q_prediction_gap(
+                point, loss_table, q_level, v_sq_line_table,
+                ac_flow_table, alpha_by_point,
+            ))
+
+    # ---- 계측 추가 라운드(2차분) 작업C-2/C-3: 기준1/기준2 측정 (같은 하네스, 방식
+    # 목록보다 먼저 - 지시서 "방식 목록의 맨 앞에 출력하라") ----
+    none_entry = _build_problem_proto('none', n=1, T=PM.TIME_STEPS)
+    pcs_only_entry = _build_problem_proto('pcs_only', n=1, T=PM.TIME_STEPS)
+    baseline1_times = _measure_baseline_timing(
+        "기준1 (force_q_zero=True 등가 - Q=0, 다각형/PCS 항 없음)", none_entry, loss_table
+    )
+    baseline2_times = _measure_baseline_timing(
+        "기준2 (Q 자유 + PCS 비용 항만, 손실 편익 항 없음)", pcs_only_entry, loss_table
+    )
 
     # ---- 작업 A-5: CSV를 실행 내내 열어 두고 조합마다 즉시 append(중단돼도 보존) ----
-    csv_path = _make_path()
     csv_file, csv_writer = _open_csv_writer(csv_path)
 
     solver_usage = {}
     inaccurate_events = []
     pad_warn_events = []
     total_solves = 0
+    method_report_rows = []
 
     try:
         for method, M in METHODS:
@@ -1668,9 +3163,21 @@ if __name__ == '__main__':
                     qp_build_times[point['point_id']] = time.perf_counter() - t0
                 avg_entries_for_diag.append(avg_entry)
 
-                outcome = _process(point, method, M, avg_entry, loss_table, qstar_full,
-                                    baselines, v_sq_line_table)
+                outcome = _process(
+                    point, method, M, avg_entry, loss_table, qstar_full,
+                    baselines, v_sq_line_table, ac_flow_table,
+                )
                 per_point_outcomes.append((point, outcome))
+                ledger = outcome['annual_components']
+                q_hours, q_sum = outcome['q_avg_lp']
+                method_report_rows.append(dict(
+                    label=(f"PWL M={M}" if method == 'pwl' else 'QP'),
+                    point_id=point['point_id'], j_net_a=outcome['j_net_a'],
+                    j_net_b=outcome['j_net_b'], j_net_c=outcome['j_net_c'],
+                    q_hours=q_hours, q_sum_mvar=q_sum,
+                    solve_time_sec=outcome['solve_time_avg'],
+                    dpp=outcome['dpp_preserved_avg'], **ledger,
+                ))
 
                 # ---- 작업 A-5: 이 조합이 끝나는 즉시 CSV에 반영 ----
                 _append_rows(csv_file, csv_writer, outcome['ts_rows'])
@@ -1694,7 +3201,7 @@ if __name__ == '__main__':
 
             if per_point_outcomes:
                 _print_method_summary(method, M, per_point_outcomes, avg_entries_for_diag,
-                                       pwl_build_time, qp_build_times)
+                                       pwl_build_time, qp_build_times, baseline1_times)
     finally:
         csv_file.close()
         print(f'CSV 저장(조합 완료마다 즉시 반영됨 - 작업 A-5): {csv_path}', flush=True)
@@ -1703,4 +3210,41 @@ if __name__ == '__main__':
 
     _print_padding_summary(pad_warn_events)
     _print_solver_diagnostics(solver_usage, inaccurate_events, total_solves)
+    report_metadata = [
+        ('POLY_N', PM.POLY_N),
+        ('QP_V2_CORRECTION', QP_V2_CORRECTION),
+        ('QP_QE_BASE_AC', QP_QE_BASE_AC),
+        ('QP_GROSSUP', QP_GROSSUP),
+        ('QP_GROSSUP_ALPHA', QP_GROSSUP_ALPHA),
+        ('Q_DIAG_LEVELS', Q_DIAG_LEVELS),
+        ('Q_BOUNDARY_POINTS', Q_BOUNDARY_POINTS),
+    ]
+    report_timings = [
+        dict(
+            item='loss_table', expected_calls=loss_table_expected_calls,
+            actual_calls=loss_table_n_runpp_calls,
+            wall_time_sec=loss_table_wall_time_sec,
+            sec_per_call=loss_table_sec_per_call,
+        ),
+        dict(
+            item='alpha_pq', expected_calls=alpha_expected_calls,
+            actual_calls=alpha_actual_calls, wall_time_sec=alpha_wall_time_sec,
+            sec_per_call=alpha_sec_per_call,
+        ),
+    ]
+    for pid, value in baseline1_times.items():
+        report_timings.append(dict(
+            item=f'baseline1_solve_{pid}', expected_calls=None, actual_calls=None,
+            wall_time_sec=value, sec_per_call=None,
+        ))
+    for pid, value in baseline2_times.items():
+        report_timings.append(dict(
+            item=f'baseline2_solve_{pid}', expected_calls=None, actual_calls=None,
+            wall_time_sec=value, sec_per_call=None,
+        ))
+    _write_numeric_report(
+        _report_path(csv_path), report_metadata, report_timings,
+        alpha_constant_rows, baseline_report_rows, method_report_rows,
+        prediction_report_rows, alpha_rows,
+    )
     _print_interpretation()
