@@ -273,13 +273,14 @@ def test_b_loss_can_be_negative():
 
 
 def test_loss_pcs_hand_calc_reference_table():
-    """CMD_pcs_loss.md 2절 참고 수치 표 재현 (eta_pcs=0.97=params.ETA_PCS 기본값).
+    """확정 PCS 효율 기준 참고 수치 재현 (eta_pcs=0.975=params.ETA_PCS 기본값).
     Loss_pcs = (1-eta)*[sqrt(P^2+Q^2) - |P|]."""
     p_net = {'x': np.array([0.00, 0.14, 0.00])}
     q_mvar = {'x': np.array([1.20, 1.20, 1.68])}
     result = benefits.loss_pcs(p_net, q_mvar)
-    expected = np.array([0.0360, 0.0320, 0.0504])
-    assert np.allclose(result['x'], expected, atol=1e-3), result['x']
+    assert np.isclose(PM.ETA_PCS, 0.975), PM.ETA_PCS
+    expected = np.array([0.03000000, 0.02670348, 0.04200000])
+    assert np.allclose(result['x'], expected, atol=1e-8), result['x']
     print('test_loss_pcs_hand_calc_reference_table OK', result['x'])
 
 
@@ -314,6 +315,138 @@ def test_check_b_energy_decomposition_detects_mismatch():
     print('test_check_b_energy_decomposition_detects_mismatch OK')
 
 
+def test_select_peak_day_and_tie_break():
+    first, second = PM.PEAK_DAYS
+    selected = benefits.select_peak_day({
+        first: np.array([4.0, 5.0]),
+        second: np.array([3.0, 7.0]),
+    })
+    assert selected == second, selected
+
+    tied = benefits.select_peak_day({
+        first: np.array([7.0, 1.0]),
+        second: np.array([2.0, 7.0]),
+    })
+    assert tied == first, tied
+    print('test_select_peak_day_and_tie_break OK')
+
+
+def test_b_energy_adjusted_hand_calc_and_none():
+    base = {s: np.array([10.0, 10.0]) for s in PM.AVG_DAYS}
+    ess = {s: np.array([9.0, 9.0]) for s in PM.AVG_DAYS}
+    smp = {s: np.array([100.0, 100.0]) for s in PM.AVG_DAYS}
+    weights = {s: 3.0 for s in PM.AVG_DAYS}
+
+    original = benefits.b_energy(base, ess, smp, weights)
+    unchanged = benefits.b_energy_adjusted(base, ess, smp, weights, None)
+    adjusted = benefits.b_energy_adjusted(
+        base, ess, smp, weights, PM.AVG_DAYS[0]
+    )
+    one_day = 2.0 * 100.0 * PM.DT_HOURS
+    assert np.isclose(unchanged, original), (unchanged, original)
+    assert np.isclose(original - adjusted, one_day), (original, adjusted)
+    print('test_b_energy_adjusted_hand_calc_and_none OK')
+
+
+def test_b_energy_peak_day_hand_calc():
+    peak = PM.PEAK_DAYS[0]
+    base = {peak: np.array([12.0, 11.0, 10.0])}
+    ess = {peak: np.array([10.0, 10.0, 9.0])}
+    smp = {peak: np.array([100.0, 200.0, 300.0])}
+    expected = (2.0 * 100.0 + 1.0 * 200.0 + 1.0 * 300.0) * PM.DT_HOURS
+    actual = benefits.b_energy_peak_day(base, ess, smp, peak)
+    assert np.isclose(actual, expected), (actual, expected)
+    print('test_b_energy_peak_day_hand_calc OK')
+
+
+def test_total_energy_day_count_preserved():
+    adjusted_season = PM.AVG_DAYS[0]
+    peak_day = PM.PEAK_DAYS[0]
+    weights = {s: 2.0 for s in PM.AVG_DAYS}
+    avg_base = {s: np.array([1.0]) for s in PM.AVG_DAYS}
+    avg_ess = {s: np.array([0.0]) for s in PM.AVG_DAYS}
+    avg_smp = {s: np.array([1.0]) for s in PM.AVG_DAYS}
+    peak_base = {peak_day: np.array([1.0])}
+    peak_ess = {peak_day: np.array([0.0])}
+    all_smp = dict(avg_smp, **{peak_day: np.array([1.0])})
+
+    original = benefits.b_energy(avg_base, avg_ess, avg_smp, weights)
+    adjusted = benefits.b_energy_adjusted(
+        avg_base, avg_ess, all_smp, weights, adjusted_season
+    )
+    peak = benefits.b_energy_peak_day(
+        peak_base, peak_ess, all_smp, peak_day
+    )
+    assert np.isclose(adjusted + peak, original), (adjusted, peak, original)
+    print('test_total_energy_day_count_preserved OK')
+
+
+def test_b_arb_loss_total_identity():
+    adjusted_season = PM.AVG_DAYS[0]
+    peak_day = PM.PEAK_DAYS[0]
+    weights = {s: 2.0 for s in PM.AVG_DAYS}
+    smp = {s: np.array([100.0, 150.0]) for s in PM.AVG_DAYS}
+    smp[peak_day] = np.array([200.0, 250.0])
+
+    load = {s: np.array([10.0, 10.0]) for s in PM.AVG_DAYS}
+    loss_base = {s: np.array([1.0, 1.0]) for s in PM.AVG_DAYS}
+    loss_ess = {s: np.array([0.8, 0.9]) for s in PM.AVG_DAYS}
+    p_ch = {s: np.array([1.0, 0.0]) for s in PM.AVG_DAYS}
+    p_dis = {s: np.array([0.0, 2.0]) for s in PM.AVG_DAYS}
+    p_net = {s: p_dis[s] - p_ch[s] for s in PM.AVG_DAYS}
+    slack_base = {s: load[s] + loss_base[s] for s in PM.AVG_DAYS}
+    slack_ess = {
+        s: load[s] + loss_ess[s] - p_net[s] for s in PM.AVG_DAYS
+    }
+
+    peak_load = np.array([12.0, 12.0])
+    loss_base_peak = {peak_day: np.array([1.2, 1.2])}
+    loss_ess_peak = {peak_day: np.array([1.0, 1.1])}
+    p_ch_peak = {peak_day: np.array([0.0, 1.0])}
+    p_dis_peak = {peak_day: np.array([2.0, 0.0])}
+    peak_net = p_dis_peak[peak_day] - p_ch_peak[peak_day]
+    slack_base_peak = {peak_day: peak_load + loss_base_peak[peak_day]}
+    slack_ess_peak = {
+        peak_day: peak_load + loss_ess_peak[peak_day] - peak_net
+    }
+
+    energy_total = benefits.b_energy_adjusted(
+        slack_base, slack_ess, smp, weights, adjusted_season
+    ) + benefits.b_energy_peak_day(
+        slack_base_peak, slack_ess_peak, smp, peak_day
+    )
+    arb_total = benefits.b_arb_total(
+        p_ch, p_dis, smp, weights, adjusted_season, peak_day,
+        p_ch_peak, p_dis_peak,
+    )
+    loss_total = benefits.b_loss_total(
+        loss_base, loss_ess, smp, weights, adjusted_season, peak_day,
+        loss_base_peak, loss_ess_peak,
+    )
+    assert np.isclose(arb_total + loss_total, energy_total), (
+        arb_total, loss_total, energy_total
+    )
+    print('test_b_arb_loss_total_identity OK')
+
+
+def test_b_energy_adjusted_negative_weight_raises():
+    adjusted_season = PM.AVG_DAYS[0]
+    base = {s: np.array([1.0]) for s in PM.AVG_DAYS}
+    ess = {s: np.array([0.0]) for s in PM.AVG_DAYS}
+    smp = {s: np.array([1.0]) for s in PM.AVG_DAYS}
+    weights = {s: 1.0 for s in PM.AVG_DAYS}
+    weights[adjusted_season] = 0.5
+    try:
+        benefits.b_energy_adjusted(
+            base, ess, smp, weights, adjusted_season
+        )
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised, '조정 후 음수 일수가중을 허용함'
+    print('test_b_energy_adjusted_negative_weight_raises OK')
+
+
 if __name__ == '__main__':
     test_b_energy_hand_calc()
     test_b_energy_missing_scenario_key_raises()
@@ -333,4 +466,10 @@ if __name__ == '__main__':
     test_loss_pcs_zero_when_q_zero()
     test_loss_pcs_custom_eta_and_key_mismatch_raises()
     test_check_b_energy_decomposition_detects_mismatch()
+    test_select_peak_day_and_tie_break()
+    test_b_energy_adjusted_hand_calc_and_none()
+    test_b_energy_peak_day_hand_calc()
+    test_total_energy_day_count_preserved()
+    test_b_arb_loss_total_identity()
+    test_b_energy_adjusted_negative_weight_raises()
     print('all benefits tests passed')

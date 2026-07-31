@@ -1,7 +1,7 @@
 import pandapower.networks as nw
 
 import params as PM
-from params import VN_KV, K_SCALE, LINE_RATINGS_A, LINE_RATING_DEFAULT_A
+from params import VN_KV, K_P, K_Q, LINE_RATINGS_A, LINE_RATING_DEFAULT_A
 
 
 def build_net(slack_vm_pu=None):
@@ -20,9 +20,20 @@ def build_net(slack_vm_pu=None):
     net.bus['vn_kv'] = VN_KV
     net.ext_grid['vm_pu'] = slack_vm_pu
 
-    # 부하 스케일 (유효·무효 동일 계수 K -> 역률 보존)
-    net.load['p_mw'] *= K_SCALE
-    net.load['q_mvar'] *= K_SCALE
+    # 부하 스케일: 원본 case33bw 합(P=3.715MW, Q=2.300Mvar)에 각각 적용해
+    # 총 S=10MVA, 종합 역률 0.95를 만든다. 버스별 원본 P/Q 분포는 보존한다.
+    original_p_sum = float(net.load['p_mw'].sum())
+    original_q_sum = float(net.load['q_mvar'].sum())
+    if (
+        abs(original_p_sum - PM.CASE33_P_MW) > 1e-9
+        or abs(original_q_sum - PM.CASE33_Q_MVAR) > 1e-9
+    ):
+        raise RuntimeError(
+            'case33bw 원본 부하 합 불일치: '
+            f'P={original_p_sum:.12g}MW, Q={original_q_sum:.12g}Mvar'
+        )
+    net.load['p_mw'] *= K_P
+    net.load['q_mvar'] *= K_Q
 
     # 선로 정격 주입 (max_i_ka 더미(99999) 대체). tie 선로(in_service=False)는 제약 미대상이라 default만 적용.
     for idx, row in net.line.iterrows():

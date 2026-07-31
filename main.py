@@ -18,8 +18,8 @@ evaluate.evaluate_particle에 그대로 넘긴다.
 ★ runs.csv의 편익 분해·페널티 컬럼(j_net/b_energy/.../penalty_v/penalty_line)은 --diagnose
 여부와 무관하게 항상 기록한다. full 프로파일(30 run)에서 --diagnose가 stdout에 30줄을
 흘려보내고 끝나면 postprocess.py가 사후 분석할 자료가 남지 않기 때문이다. run당 gbest
-해에 대해 evaluate_particle(return_detail=True)를 1회 더 호출하는 비용(run당 ~0.7초)을
-치른다. --diagnose는 이제 "CSV에 이미 남는 값을 화면에서도 보기"로 역할이 축소됐다 -
+해에 대해 evaluate_particle(return_detail=True, collect_diagnostics=True)를 1회 더 호출한다.
+--diagnose는 이제 "CSV에 이미 남는 값을 화면에서도 보기"로 역할이 축소됐다 -
 재평가를 또 하지 않고 CSV 기록에 쓴 detail을 그대로 출력한다.
 
 ★ 확정 사항 3) postprocess.py 자동 실행. runs.csv/generations.csv는 기존처럼 run마다
@@ -47,6 +47,7 @@ import numpy as np
 
 import params as PM
 import evaluate
+import loss_coeffs
 import pso_core
 import postprocess
 
@@ -63,13 +64,20 @@ PROFILES = {
     'full': dict(n_particles=32, n_iters=100, n_runs=30),
 }
 
-GEN_FIELDS = ['n_ess', 'run', 'gen', 'gbest_f', 'mean_f', 'std_f', 'worst_f', 'elapsed_s']
+GEN_FIELDS = [
+    'n_ess', 'run', 'gen', 'gbest_f', 'mean_f', 'std_f', 'worst_f',
+    'elapsed_s', 'coef_cache_hit_rate_cumulative',
+]
 RUN_FIELDS = [
     'n_ess', 'run', 'seed', 'gbest_f', 'x_json', 'wall_time_s',
     'n_diverged_total', 'n_negative_bdefer', 'min_bdefer',
     # ★ gbest 해의 편익 분해·페널티 (--diagnose 무관 상시 기록, 아래 "확정 사항 2)" 참조).
-    'j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss', 'cost',
+    'j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss',
+    'b_arb_total', 'b_loss_total', 'cost',
     'v_violation', 'i_violation', 'penalty_v', 'penalty_line', 'decomposition_ok',
+    'recompute_jnet_delta', 'recompute_convergence_ratio', 'recompute_max_p_shift',
+    'coef_cache_hit_rate', 'coef_runpp_total', 'coef_unique_bs_count',
+    'coef_measure_wall_s',
 ]
 
 # gbest_f(PSO가 이미 추적 중인 값) vs -j_net+penalty_v+penalty_line(gbest 해를 사후 재평가해
@@ -99,7 +107,8 @@ RUN_CONSISTENCY_ATOL_WON = 10.0
 #   사라진다. postprocess.py가 편익 분해(8절)를 다루려면 파일에 남아 있어야 한다.
 # - run당 gbest 해 1개에 대해서만 evaluate_particle(return_detail=True)를 추가 호출한다
 #   (전 입자 기록은 CLAUDE.md 7-A절 "중간 저장" 원칙과 충돌 - 비용 대비 이득 없음).
-#   run당 ~0.7초, 30 run이면 ~21초 - 무시 가능.
+#   명령 G 이후 gbest 상세 경로는 X0/X2·전압 진단을 추가로 수행하지만 run당 1회뿐이며,
+#   PSO의 전 입자 평가에는 collect_diagnostics=False라 이 추가 비용이 없다.
 # - 검산(-j_net+penalty_v+penalty_line == gbest_f)은 경고만 하고 죽이지 않는다. 본실험
 #   30 run 중간에 assert로 죽으면 그 기수 전체를 다시 돌려야 해 손해가 훨씬 크다.
 
@@ -167,9 +176,15 @@ def _eval_for_pso(x3n):
     발생 여부를 알 수 없음) - fitness 스칼라만 반환하는 경로로는 이 정보에 접근할 수 없다.
     """
     detail = evaluate.evaluate_particle(x3n, return_detail=True)
+    # 각 Pool 워커의 프로세스 로컬 캐시 통계를 평가 결과에 편승시킨다.
+    # 실패해도 fitness 반환은 유지하여 진단 계측이 PSO를 중단시키지 않게 한다.
+    try:
+        cache_info = dict(pid=os.getpid(), **loss_coeffs.cache_info())
+    except Exception as exc:
+        cache_info = dict(pid=os.getpid(), error=repr(exc))
     if detail.get('diverged'):
-        return detail['fitness'], True, None
-    return detail['fitness'], False, detail['b_defer']
+        return detail['fitness'], True, None, cache_info
+    return detail['fitness'], False, detail['b_defer'], cache_info
 
 
 # ============================================================
@@ -185,14 +200,86 @@ class RunObjective:
     호출부(run_single)가 그것과 이 클래스의 gen_rows(세대별 집단 통계)를 나중에 합친다.
     """
 
-    def __init__(self, pool, n_ess):
+    _CACHE_COUNTERS = (
+        'hits', 'misses', 'runpp_attempts', 'measure_wall_s', 'size',
+    )
+
+    def __init__(self, pool, n_ess, expected_workers):
         self.pool = pool
         self.n_ess = n_ess
+        self.expected_workers = int(expected_workers)
         self.n_diverged_total = 0
         self.n_negative_bdefer = 0
         self.min_bdefer = float('inf')
         self.gen_rows = []  # gen, mean_f, std_f, worst_f, elapsed_s (gbest_f는 history에서 채움)
         self._gen_idx = 0
+        self._cache_first_by_pid = {}
+        self._cache_last_by_pid = {}
+        self._cache_collection_failed = False
+
+    def _record_cache_info(self, info):
+        """PID별 이 run의 첫/마지막 누적 카운터를 보관한다.
+
+        첫 스냅샷은 해당 워커의 첫 평가 *후* 값이므로 차분에서 워커당 첫
+        평가 1건이 빠진다. 워커 강제 살포 없이 실제 평가 워커를 빠짐없이
+        관측하기 위한 의도된 상한 n_workers건의 근사다.
+        """
+        try:
+            if not info or info.get('error'):
+                raise ValueError(info.get('error', 'cache_info missing') if info else 'cache_info missing')
+            pid = int(info['pid'])
+            snap = {name: float(info[name]) for name in self._CACHE_COUNTERS}
+            self._cache_first_by_pid.setdefault(pid, snap)
+            self._cache_last_by_pid[pid] = snap
+        except Exception as exc:
+            if not self._cache_collection_failed:
+                print(f'  경고: 워커 캐시 통계 수집 실패({exc!r}); 이 run의 캐시 통계는 NaN 처리합니다.',
+                      flush=True)
+            self._cache_collection_failed = True
+
+    def _cache_deltas(self):
+        if self._cache_collection_failed or not self._cache_last_by_pid:
+            return None
+        totals = {name: 0.0 for name in self._CACHE_COUNTERS}
+        for pid, last in self._cache_last_by_pid.items():
+            first = self._cache_first_by_pid[pid]
+            for name in self._CACHE_COUNTERS:
+                totals[name] += max(0.0, last[name] - first[name])
+        return totals
+
+    def _cache_hit_rate_cumulative(self):
+        totals = self._cache_deltas()
+        if totals is None:
+            return float('nan')
+        requests = totals['hits'] + totals['misses']
+        return totals['hits'] / requests if requests else float('nan')
+
+    def cache_run_fields(self):
+        """전 평가 워커의 run 증분 합을 runs.csv 필드로 변환한다.
+
+        coef_unique_bs_count는 정확한 전역 (b,S) 고유수가 아니다. 워커별
+        cache size 증가량의 합으로, 워커 간 중복을 포함하는 상한 프록시다.
+        coef_measure_wall_s도 병렬 워커의 측정시간 합(CPU-time 성격)이다.
+        """
+        totals = self._cache_deltas()
+        if totals is None:
+            return dict(
+                coef_cache_hit_rate=float('nan'),
+                coef_runpp_total=float('nan'),
+                coef_unique_bs_count=float('nan'),
+                coef_measure_wall_s=float('nan'),
+            )
+        observed = len(self._cache_last_by_pid)
+        if observed < self.expected_workers:
+            print(f'  경고: 캐시 통계에서 {observed}/{self.expected_workers}개 워커 PID만 관측됨. '
+                  '실제로 평가를 반환한 워커만 집계합니다.', flush=True)
+        requests = totals['hits'] + totals['misses']
+        return dict(
+            coef_cache_hit_rate=totals['hits'] / requests if requests else float('nan'),
+            coef_runpp_total=int(round(totals['runpp_attempts'])),
+            coef_unique_bs_count=int(round(totals['size'])),
+            coef_measure_wall_s=totals['measure_wall_s'],
+        )
 
     def __call__(self, X):
         X = np.asarray(X, dtype=float)
@@ -203,8 +290,9 @@ class RunObjective:
         elapsed_s = time.perf_counter() - t0
 
         fitness = np.empty(len(results), dtype=float)
-        for i, (fit, diverged, b_defer) in enumerate(results):
+        for i, (fit, diverged, b_defer, cache_info) in enumerate(results):
             fitness[i] = fit
+            self._record_cache_info(cache_info)
             if diverged:
                 self.n_diverged_total += 1
             else:
@@ -219,6 +307,7 @@ class RunObjective:
             std_f=float(np.std(fitness)),
             worst_f=float(np.max(fitness)),
             elapsed_s=elapsed_s,
+            coef_cache_hit_rate_cumulative=self._cache_hit_rate_cumulative(),
         ))
         self._gen_idx += 1
 
@@ -254,7 +343,11 @@ def _evaluate_gbest_detail(gbest_x_3n):
     """run 종료 후 gbest 해 1개에 대해서만 evaluate_particle(return_detail=True)를 호출한다
     (전 입자 기록은 안 함). 부록B의 LAMBDA_V/LAMBDA_LINE/PENALTY_DIVERGE가 전부 "잠정값,
     첫 실행 로그 보고 조정"이므로 이 값을 볼 수단이 CSV에도 항상 남아 있어야 한다."""
-    return evaluate.evaluate_particle(np.asarray(gbest_x_3n, dtype=float), return_detail=True)
+    x = np.asarray(gbest_x_3n, dtype=float)
+    detail = evaluate.evaluate_particle(
+        x, return_detail=True, collect_diagnostics=True
+    )
+    return dict(detail)
 
 
 def _gbest_detail_to_run_fields(detail, gbest_f):
@@ -267,8 +360,12 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
         print('  경고: gbest 해가 발산 상태 - 편익 분해 불가(전 입자 발산 등 비정상 상황).',
               flush=True)
         return dict(
-            j_net='', b_energy='', b_defer='', b_arb='', b_loss='', cost='',
+            j_net='', b_energy='', b_defer='', b_arb='', b_loss='',
+            b_arb_total='', b_loss_total='', cost='',
             v_violation='', i_violation='', penalty_v='', penalty_line='', decomposition_ok='',
+            recompute_jnet_delta='', recompute_convergence_ratio='',
+            recompute_max_p_shift='', coef_cache_hit_rate='',
+            coef_runpp_total='', coef_unique_bs_count='', coef_measure_wall_s='',
         )
 
     penalty_v = PM.LAMBDA_V * detail['v_violation']
@@ -284,10 +381,21 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
 
     return dict(
         j_net=detail['j_net'], b_energy=detail['b_energy'], b_defer=detail['b_defer'],
-        b_arb=detail['b_arb'], b_loss=detail['b_loss'], cost=detail['cost'],
+        b_arb=detail['b_arb'], b_loss=detail['b_loss'],
+        b_arb_total=detail['b_arb_total'], b_loss_total=detail['b_loss_total'],
+        cost=detail['cost'],
         v_violation=detail['v_violation'], i_violation=detail['i_violation'],
         penalty_v=penalty_v, penalty_line=penalty_line,
         decomposition_ok=detail['decomposition_ok'],
+        recompute_jnet_delta=detail.get('recompute_jnet_delta', float('nan')),
+        recompute_convergence_ratio=detail.get(
+            'recompute_convergence_ratio', float('nan')
+        ),
+        recompute_max_p_shift=detail.get('recompute_max_p_shift', float('nan')),
+        coef_cache_hit_rate=detail.get('coef_cache_hit_rate', float('nan')),
+        coef_runpp_total=detail.get('coef_runpp_total', float('nan')),
+        coef_unique_bs_count=detail.get('coef_unique_bs_count', float('nan')),
+        coef_measure_wall_s=detail.get('coef_measure_wall_s', float('nan')),
     )
 
 
@@ -340,7 +448,7 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
     pool = mp.Pool(n_workers, initializer=evaluate.init_worker)
     try:
         for run_idx in range(profile['n_runs']):
-            objective = RunObjective(pool, n_ess)
+            objective = RunObjective(pool, n_ess, n_workers)
             pso = pso_core.PSO(
                 objective=objective,
                 bounds=bounds,
@@ -365,7 +473,10 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
             gen_rows_full = [
                 dict(n_ess=n_ess, run=run_idx, gen=row['gen'], gbest_f=float(gbest_f),
                      mean_f=row['mean_f'], std_f=row['std_f'], worst_f=row['worst_f'],
-                     elapsed_s=row['elapsed_s'])
+                     elapsed_s=row['elapsed_s'],
+                     coef_cache_hit_rate_cumulative=row[
+                         'coef_cache_hit_rate_cumulative'
+                     ])
                 for row, gbest_f in zip(objective.gen_rows, history)
             ]
             _append_csv_rows(gens_path, GEN_FIELDS, gen_rows_full)
@@ -382,6 +493,9 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
             # ★ --diagnose 여부와 무관하게 항상 계산·기록 (확정 사항 2)).
             gbest_detail = _evaluate_gbest_detail(result['x'])
             benefit_fields = _gbest_detail_to_run_fields(gbest_detail, gbest_f)
+            # G의 메인 프로세스 gbest 1회 통계 대신, PSO를 수행한 전 워커의
+            # PID별 누적 카운터 baseline 차분 합으로 runs.csv를 채운다.
+            benefit_fields.update(objective.cache_run_fields())
 
             run_row = dict(
                 n_ess=n_ess, run=run_idx, seed=seed_repr,

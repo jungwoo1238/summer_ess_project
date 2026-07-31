@@ -18,6 +18,20 @@ import numpy as np
 import params as PM
 
 
+PEAK_TO_SEASON = {
+    'summer_peak': 'summer',
+    'winter_peak': 'winter',
+}
+assert set(PEAK_TO_SEASON.keys()) == set(PM.PEAK_DAYS), (
+    f'PEAK_TO_SEASON 키와 PEAK_DAYS 불일치: '
+    f'{set(PEAK_TO_SEASON.keys())} vs {set(PM.PEAK_DAYS)}'
+)
+assert set(PEAK_TO_SEASON.values()) <= set(PM.AVG_DAYS), (
+    f'PEAK_TO_SEASON 값이 AVG_DAYS에 없음: '
+    f'{set(PEAK_TO_SEASON.values()) - set(PM.AVG_DAYS)}'
+)
+
+
 def _assert_keys(data, required_keys, name):
     missing = set(required_keys) - set(data.keys())
     assert not missing, f'{name}에 필수 시나리오 키 누락: {missing}'
@@ -99,6 +113,93 @@ def b_energy(p_slack_base, p_slack_ess, smp_mwh, n_weekdays):
         day_won = float(np.sum(delta_mw * smp_mwh[s])) * PM.DT_HOURS
         total_won += n_weekdays[s] * day_won
     return total_won
+
+
+def select_peak_day(p_slack_ess):
+    """ESS 슬랙피크가 최대인 PEAK 시나리오를 반환한다.
+
+    동점이면 PM.PEAK_DAYS 순서상 앞선 시나리오를 유지한다.
+    """
+    _assert_keys(p_slack_ess, PM.PEAK_DAYS, 'p_slack_ess')
+
+    best_scenario = None
+    best_peak_mw = -np.inf
+    for scenario in PM.PEAK_DAYS:
+        peak_mw = float(np.max(p_slack_ess[scenario]))
+        if peak_mw > best_peak_mw:
+            best_peak_mw = peak_mw
+            best_scenario = scenario
+    return best_scenario
+
+
+def b_energy_adjusted(
+    p_slack_base,
+    p_slack_ess,
+    smp_mwh,
+    n_weekdays,
+    adjusted_season,
+):
+    """AVG_DAYS 에너지 편익 [원].
+
+    확정 피크일을 별도 계상하므로 adjusted_season의 평균일 가중만 1일 줄인다.
+    adjusted_season=None이면 기존 b_energy와 동일하다.
+    """
+    for data, name in (
+        (p_slack_base, 'p_slack_base'),
+        (p_slack_ess, 'p_slack_ess'),
+        (smp_mwh, 'smp_mwh'),
+        (n_weekdays, 'n_weekdays'),
+    ):
+        _assert_keys(data, PM.AVG_DAYS, name)
+    assert adjusted_season is None or adjusted_season in PM.AVG_DAYS, (
+        f'adjusted_season이 AVG_DAYS에 없음: {adjusted_season!r}'
+    )
+
+    total_won = 0.0
+    for scenario in PM.AVG_DAYS:
+        weight = float(n_weekdays[scenario]) - (
+            1.0 if scenario == adjusted_season else 0.0
+        )
+        assert weight >= 0.0, (
+            f'조정 후 일수가중 음수: scenario={scenario}, weight={weight}'
+        )
+        delta_mw = (
+            np.asarray(p_slack_base[scenario])
+            - np.asarray(p_slack_ess[scenario])
+        )
+        day_won = (
+            float(np.sum(delta_mw * np.asarray(smp_mwh[scenario])))
+            * PM.DT_HOURS
+        )
+        total_won += weight * day_won
+    return total_won
+
+
+def b_energy_peak_day(
+    p_slack_base,
+    p_slack_ess,
+    smp_mwh,
+    peak_scenario,
+):
+    """확정 피크일 하루치 에너지 편익 [원] (가중 1일)."""
+    assert peak_scenario in PM.PEAK_DAYS, (
+        f'peak_scenario가 PEAK_DAYS에 없음: {peak_scenario!r}'
+    )
+    for data, name in (
+        (p_slack_base, 'p_slack_base'),
+        (p_slack_ess, 'p_slack_ess'),
+        (smp_mwh, 'smp_mwh'),
+    ):
+        assert peak_scenario in data, f'{name}에 {peak_scenario} 없음'
+
+    delta_mw = (
+        np.asarray(p_slack_base[peak_scenario])
+        - np.asarray(p_slack_ess[peak_scenario])
+    )
+    return (
+        float(np.sum(delta_mw * np.asarray(smp_mwh[peak_scenario])))
+        * PM.DT_HOURS
+    )
 
 
 def b_defer(p_slack_base, p_slack_ess):
@@ -183,6 +284,115 @@ def b_loss(loss_base, loss_ess, smp_mwh, n_weekdays):
         delta_mw = loss_base[s] - loss_ess[s]
         day_won = float(np.sum(delta_mw * smp_mwh[s])) * PM.DT_HOURS
         total_won += n_weekdays[s] * day_won
+    return total_won
+
+
+def b_arb_total(
+    p_ch,
+    p_dis,
+    smp_mwh,
+    n_weekdays,
+    adjusted_season,
+    peak_day,
+    p_ch_peak,
+    p_dis_peak,
+):
+    """조달비 편익, 총편익 기준: 조정 AVG + 확정 피크일 1일 [원]."""
+    for data, name in (
+        (p_ch, 'p_ch'),
+        (p_dis, 'p_dis'),
+        (smp_mwh, 'smp_mwh'),
+        (n_weekdays, 'n_weekdays'),
+    ):
+        _assert_keys(data, PM.AVG_DAYS, name)
+    for data, name in (
+        (p_ch_peak, 'p_ch_peak'),
+        (p_dis_peak, 'p_dis_peak'),
+        (smp_mwh, 'smp_mwh'),
+    ):
+        assert peak_day in data, f'{name}에 {peak_day} 없음'
+    assert adjusted_season in PM.AVG_DAYS
+    assert peak_day in PM.PEAK_DAYS
+
+    total_won = 0.0
+    for scenario in PM.AVG_DAYS:
+        weight = float(n_weekdays[scenario]) - (
+            1.0 if scenario == adjusted_season else 0.0
+        )
+        assert weight >= 0.0, (
+            f'조정 후 일수가중 음수: scenario={scenario}, weight={weight}'
+        )
+        net_mw = np.asarray(p_dis[scenario]) - np.asarray(p_ch[scenario])
+        total_won += (
+            weight
+            * float(np.sum(net_mw * np.asarray(smp_mwh[scenario])))
+            * PM.DT_HOURS
+        )
+
+    net_peak_mw = (
+        np.asarray(p_dis_peak[peak_day])
+        - np.asarray(p_ch_peak[peak_day])
+    )
+    total_won += (
+        float(np.sum(net_peak_mw * np.asarray(smp_mwh[peak_day])))
+        * PM.DT_HOURS
+    )
+    return total_won
+
+
+def b_loss_total(
+    loss_base,
+    loss_ess,
+    smp_mwh,
+    n_weekdays,
+    adjusted_season,
+    peak_day,
+    loss_base_peak,
+    loss_ess_peak,
+):
+    """손실 편익, 총편익 기준: 조정 AVG + 확정 피크일 1일 [원]."""
+    for data, name in (
+        (loss_base, 'loss_base'),
+        (loss_ess, 'loss_ess'),
+        (smp_mwh, 'smp_mwh'),
+        (n_weekdays, 'n_weekdays'),
+    ):
+        _assert_keys(data, PM.AVG_DAYS, name)
+    for data, name in (
+        (loss_base_peak, 'loss_base_peak'),
+        (loss_ess_peak, 'loss_ess_peak'),
+        (smp_mwh, 'smp_mwh'),
+    ):
+        assert peak_day in data, f'{name}에 {peak_day} 없음'
+    assert adjusted_season in PM.AVG_DAYS
+    assert peak_day in PM.PEAK_DAYS
+
+    total_won = 0.0
+    for scenario in PM.AVG_DAYS:
+        weight = float(n_weekdays[scenario]) - (
+            1.0 if scenario == adjusted_season else 0.0
+        )
+        assert weight >= 0.0, (
+            f'조정 후 일수가중 음수: scenario={scenario}, weight={weight}'
+        )
+        delta_mw = (
+            np.asarray(loss_base[scenario])
+            - np.asarray(loss_ess[scenario])
+        )
+        total_won += (
+            weight
+            * float(np.sum(delta_mw * np.asarray(smp_mwh[scenario])))
+            * PM.DT_HOURS
+        )
+
+    delta_peak_mw = (
+        np.asarray(loss_base_peak[peak_day])
+        - np.asarray(loss_ess_peak[peak_day])
+    )
+    total_won += (
+        float(np.sum(delta_peak_mw * np.asarray(smp_mwh[peak_day])))
+        * PM.DT_HOURS
+    )
     return total_won
 
 

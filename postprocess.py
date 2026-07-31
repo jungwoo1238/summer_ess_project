@@ -45,7 +45,6 @@ import numpy as np
 
 import params as PM
 import benefits
-import lower_lp
 import evaluate
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +60,7 @@ DECOMP_RTOL = 1e-9                # 원칙4: 금액·기대값!=0 -> rtol=1e-9, 
 DECOMP_ATOL_NEAR_ZERO = 10.0      # 원칙4: 금액·기대값=0 -> atol=10.0 (test_evaluate.py won_atol과 동일 계보)
 BOUNDARY_WARN_FRAC = 0.02         # 정규화 위치가 이 미만/((1-이 값) 초과)면 경계 근접 경고
 SOC_CYCLE_ATOL_MWH = 1e-4         # SOC[24]==SOC[0] 검증 허용오차 (lower_lp._assert_physics의 tol과 동일)
+Q_NONZERO_TOL_MVAR = 1e-9
 
 
 def section(title):
@@ -86,8 +86,12 @@ def _check_env():
 
 NUMERIC_RUN_FIELDS = [
     'gbest_f', 'wall_time_s', 'n_diverged_total', 'n_negative_bdefer', 'min_bdefer',
-    'j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss', 'cost',
+    'j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss',
+    'b_arb_total', 'b_loss_total', 'cost',
     'v_violation', 'i_violation', 'penalty_v', 'penalty_line',
+    'recompute_jnet_delta', 'recompute_convergence_ratio',
+    'recompute_max_p_shift', 'coef_cache_hit_rate', 'coef_runpp_total',
+    'coef_unique_bs_count', 'coef_measure_wall_s',
 ]
 
 
@@ -240,10 +244,24 @@ def compute_gross_shares(r):
     분모가 거의 0인 나눗셈은 사소한 절대오차도 백분율로는 크게 증폭되어(예: 4.9e-7원 차이가
     0.0017%p로 보임) 100%±0.01 기준이 원래 의도(진짜 분해 오류 검출)와 무관하게 깨질 수 있다."""
     b_gross_a = r['b_defer'] + r['b_energy']
-    b_gross_b = r['b_defer'] + r['b_arb'] + r['b_loss']
-    assert _money_isclose(b_gross_b, b_gross_a), (
-        f"B_gross 교차검증 실패(run={r.get('run')}): b_defer+b_energy={b_gross_a} vs "
-        f"b_defer+b_arb+b_loss={b_gross_b}")
+    has_total = r.get('b_arb_total') is not None and r.get('b_loss_total') is not None
+    if has_total:
+        arb_value = r['b_arb_total']
+        loss_value = r['b_loss_total']
+        b_gross_b = r['b_defer'] + arb_value + loss_value
+        assert _money_isclose(b_gross_b, b_gross_a), (
+            f"B_gross 교차검증 실패(run={r.get('run')}): "
+            f"b_defer+b_energy={b_gross_a} vs "
+            f"b_defer+b_arb_total+b_loss_total={b_gross_b}"
+        )
+    elif _money_isclose(r['b_arb'] + r['b_loss'], r['b_energy']):
+        # 피크일 회계 변경 전 구 CSV는 AVG 값끼리 총편익 항등식이 성립한다.
+        arb_value = r['b_arb']
+        loss_value = r['b_loss']
+    else:
+        # 피크일 회계 변경 후이지만 total 컬럼이 없는 과도기 CSV. 서로 다른 집계범위를
+        # 억지로 비교하지 않고 총편익 내 arb/loss share만 결측 처리한다.
+        arb_value = loss_value = None
     b_gross = b_gross_a
 
     if b_gross == 0:
@@ -251,11 +269,15 @@ def compute_gross_shares(r):
                      loss_pct=float('nan'), cost_pct=float('nan'))
 
     defer_pct = r['b_defer'] / b_gross * 100
-    arb_pct = r['b_arb'] / b_gross * 100
-    loss_pct = r['b_loss'] / b_gross * 100
+    arb_pct = (
+        arb_value / b_gross * 100 if arb_value is not None else float('nan')
+    )
+    loss_pct = (
+        loss_value / b_gross * 100 if loss_value is not None else float('nan')
+    )
     cost_pct = r['cost'] / b_gross * 100
 
-    if abs(b_gross) > MONEY_NEAR_ZERO_WON:
+    if abs(b_gross) > MONEY_NEAR_ZERO_WON and arb_value is not None:
         total = defer_pct + arb_pct + loss_pct
         assert abs(total - 100.0) < 0.01, (
             f'share 합이 100%±0.01이 아님(run={r.get("run")}): {total}')
@@ -301,8 +323,18 @@ def section1_benefit_decomposition(group):
     print('  (예상: b_defer >> b_arb > b_loss)', flush=True)
 
     bad = []
+    skipped = []
     for r in runs:
-        ok, rule, diff = check_decomposition(r['b_arb'], r['b_loss'], r['b_energy'])
+        if r.get('b_arb_total') is not None and r.get('b_loss_total') is not None:
+            arb_value, loss_value = r['b_arb_total'], r['b_loss_total']
+        elif _money_isclose(r['b_arb'] + r['b_loss'], r['b_energy']):
+            arb_value, loss_value = r['b_arb'], r['b_loss']
+        else:
+            skipped.append(r['run'])
+            continue
+        ok, rule, diff = check_decomposition(
+            arb_value, loss_value, r['b_energy']
+        )
         if not ok:
             bad.append((r['run'], diff, rule))
     if bad:
@@ -310,7 +342,14 @@ def section1_benefit_decomposition(group):
         for run_idx, diff, rule in bad:
             print(f'    run={run_idx}  차이={diff:+.4f}원 ({rule})', flush=True)
     else:
-        print(f'  b_arb+b_loss≈b_energy 검산: 전 {len(runs)}건 통과', flush=True)
+        checked = len(runs) - len(skipped)
+        print(f'  총편익 분해 검산: {checked}건 통과', flush=True)
+    if skipped:
+        print(
+            f'  총편익 분해 검산 생략 {len(skipped)}건(run={skipped}): '
+            '피크일 회계 적용 후 b_arb_total/b_loss_total이 없는 과도기 CSV',
+            flush=True,
+        )
 
     return dict(degenerate=degenerate, normal=normal, decomposition_bad=bad,
                 gross_normal=gross_normal, gross_all=gross_all)
@@ -411,15 +450,21 @@ def section3_operating_metrics(group, best):
 # ============================================================
 
 def compute_schedules(installed_units):
-    """installed_units: [(b,S,E), ...]. ALL_DAYS(5개) 시나리오마다 lower_lp를 정확히
-    1회씩만 호출한다 - 이 결과를 (3)-4 EFC, (8) 유사도, (9) 원자료 CSV가 공유한다
-    (지시사항 "lower_lp 재호출은 1회만 수행"). pandapower는 호출하지 않는다.
+    """installed_units: [(b,S,E), ...]. ALL_DAYS(5개) 최종 재산출 스케줄을 한 번 만들고
+    그 결과를 (3)-4 EFC, (8) 유사도, (9) 원자료 CSV가 공유한다. 계수 측정 단계에서는
+    pandapower를 호출하지만, 최종 스케줄을 섹션별로 다시 계산하지는 않는다.
+
+    QP 계수 재산출 편입 후에는 evaluate._solve_unit_schedules를 재사용한다. 현재 재산출
+    조율 범위가 n=1이므로 installed_units가 2개 이상이면 evaluate에서 명시적으로 거부한다.
 
     ★ C.6-3 LinDistFlow 편입 이후: 전 기를 **조인트로 한 번에** 넘긴다(기별로 따로 부르지
     않는다). 이유: LinDistFlow 전압유도항이 기 사이를 결합하므로(lower_lp.py 모듈
     docstring), 기별로 따로 풀면 실제 PSO 탐색이 evaluate.py에서 찾은 해와 다른(전압유도항이
     다른 기의 존재를 못 본) 스케줄이 나온다 - 편입 전에는 기별 독립호출이 정확히 같았지만
     (분리=통합, 2절), 지금은 조인트 호출만이 사후분석의 정합성을 보장한다."""
+    # postprocess를 독립 실행하면 evaluate.init_worker()가 아직 호출되지 않아
+    # _BASE_P/_BASE_Q/_NET이 None일 수 있다. 기저 부하를 읽기 전에 지연 초기화한다.
+    evaluate._ensure_worker_state()
     base_p_sum = float(evaluate._BASE_P.sum())
     # scenario -> [(P_net[T], soc[T+1], Q[T]) per unit]. ★ CMD_diagnose_bloss.md 작업A -
     # Q도 함께 들고 다닌다(기존엔 버렸음 - 그래서 b_loss 진단이 슬랙 차이로 역추론해야 했다).
@@ -432,20 +477,14 @@ def compute_schedules(installed_units):
     E_arr = np.array([u[2] for u in installed_units], dtype=float)
     n = len(installed_units)
 
-    for s in PM.AVG_DAYS:
-        smp = np.asarray(PM.SMP[s])
-        profile = np.asarray(PM.LOAD[s])
-        P_net, Q, soc = lower_lp.solve_avg(S_arr, E_arr, b_arr, smp, profile, assert_physics=False)
+    # 최적화와 동일한 계수 측정→solve→재측정→solve 경로를 재사용한다.
+    # 현재 evaluate 재산출 조율은 n=1 범위이며 n>=2는 그 경로에서 명시적으로 거부된다.
+    unit_p, unit_q, unit_soc = evaluate._solve_unit_schedules(
+        b_arr, S_arr, E_arr, base_p_sum, return_soc=True
+    )
+    for s in PM.ALL_DAYS:
         for i in range(n):
-            schedules[s].append((P_net[i], soc[i], Q[i]))
-    for s in PM.PEAK_DAYS:
-        profile = np.asarray(PM.LOAD[s])
-        load_total = base_p_sum * profile
-        P_net, Q, soc, _pk = lower_lp.solve_peak(
-            S_arr, E_arr, b_arr, load_total, profile, assert_physics=False
-        )
-        for i in range(n):
-            schedules[s].append((P_net[i], soc[i], Q[i]))
+            schedules[s].append((unit_p[s][i], unit_soc[s][i], unit_q[s][i]))
     return schedules, base_p_sum
 
 
@@ -935,6 +974,8 @@ SCHEDULE_FIELDS = [
     'poly_margin', 'poly_binding', 'loss_pcs_mw',
     'soc', 'soc_frac',
     'load_mw', 'smp_won_per_kwh', 'p_slack_base', 'p_slack_ess', 'p_slack_ess_qzero',
+    # 현재 lower_lp/evaluate가 시각별 값을 반환하지 않아 결측으로 저장되는 그룹 C 항목.
+    'v_lindistflow', 'mu_penalty_active',
 ]
 
 # 다각형 바인딩 판정 여유(원 제약을 다각형이 근사하는 정도 - CLAUDE.md 부록C.4-(2), POLY_N=12
@@ -947,15 +988,17 @@ def get_slack_via_evaluate(units_all, n_ess):
     고치지 않고 evaluate.evaluate_particle(return_detail=True)의 기존 반환값에서 얻을 수
     있는지 확인한다 - 있으면 쓰고, 없으면(예: 발산) 두 컬럼을 생략한다고 보고한다."""
     x3 = _units_to_x3(units_all)
-    detail = evaluate.evaluate_particle(x3, return_detail=True)
+    detail = evaluate.evaluate_particle(
+        x3, return_detail=True, collect_diagnostics=True
+    )
     if detail.get('diverged'):
         print('  ★ 최적해 재평가가 발산 - p_slack_base/p_slack_ess 확보 불가, 두 컬럼 생략',
               flush=True)
-        return None, None
+        return None, None, None
     print('  p_slack_base/p_slack_ess: evaluate.evaluate_particle(return_detail=True)의 기존 '
           "반환값(_BASE_FLOW['p_slack'], detail['p_slack_ess'])에서 그대로 확보함 - evaluate.py "
           '미수정.', flush=True)
-    return evaluate._BASE_FLOW['p_slack'], detail['p_slack_ess']
+    return evaluate._BASE_FLOW['p_slack'], detail['p_slack_ess'], detail
 
 
 def compute_slack_qzero(installed_units, schedules):
@@ -975,6 +1018,10 @@ def compute_slack_qzero(installed_units, schedules):
         return {s: np.zeros(PM.TIME_STEPS) for s in PM.ALL_DAYS}
 
     evaluate._ensure_sgens(net, n)
+    # 직전 evaluate 재평가가 소멸 유닛을 포함한 더 많은 sgen 행을 만들었을 수 있다.
+    # 설치 유닛을 앞쪽 행에 재배치하기 전에 모든 잔여 주입을 0으로 지워 중복 주입을 막는다.
+    net.sgen.loc[:, 'p_mw'] = 0.0
+    net.sgen.loc[:, 'q_mvar'] = 0.0
     for i, (b, S, E) in enumerate(installed_units):
         net.sgen.at[i, 'bus'] = int(b)
 
@@ -1030,7 +1077,7 @@ def validate_schedules(installed_units, schedules):
 
 
 def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slack_ess,
-                         slack_ess_qzero=None):
+                         slack_ess_qzero=None, detail=None):
     """★ CMD_diagnose_bloss.md 작업A: q_mvar/s_apparent/s_utilization/poly_binding(기별) +
     p_slack_ess_qzero(시스템 전체, p_slack_base/p_slack_ess와 같은 성격 - 기별이 아니라
     한 시각당 하나) 열을 추가한다."""
@@ -1062,6 +1109,14 @@ def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slac
                 # PCS 무효전력 변환손실(CMD_pcs_loss.md) - benefits.loss_pcs와 동일 수식을
                 # 스칼라로 인라인(이미 s_apparent를 구해 둬서 재사용이 더 번거로움). Q=0이면 0.
                 loss_pcs_t = (1.0 - PM.ETA_PCS) * (s_apparent - abs(p_net_t))
+                v_lindistflow = ''
+                mu_penalty_active = ''
+                if detail is not None and detail.get('v_lindistflow_sq') is not None:
+                    v_sq_t = float(detail['v_lindistflow_sq'][s][int(b), t])
+                    v_lindistflow = float(np.sqrt(max(v_sq_t, 0.0)))
+                    mu_penalty_active = bool(
+                        v_sq_t < PM.V_SQ_MIN or v_sq_t > PM.V_SQ_MAX
+                    )
 
                 rows.append(dict(
                     scenario=s, t=t, unit=i, b=b,
@@ -1072,6 +1127,8 @@ def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slac
                     load_mw=float(load_mw_s[t]), smp_won_per_kwh=float(smp_s[t]),
                     p_slack_base=p_slack_base_t, p_slack_ess=p_slack_ess_t,
                     p_slack_ess_qzero=p_slack_ess_qzero_t,
+                    v_lindistflow=v_lindistflow,
+                    mu_penalty_active=mu_penalty_active,
                 ))
     return rows
 
@@ -1093,11 +1150,201 @@ def print_wide_schedule(installed_units, schedules):
             print('  ' + f'{t:>3d} | ' + ' | '.join(f'{v:>13.4f}' for v in vals), flush=True)
 
 
+GROUP_C_MISSING_REASONS = {
+    'qp_loss_model_err_max': 'LP 목적함수의 시각별 예측 손실값이 저장되지 않음',
+    'qp_loss_model_err_mean': 'LP 목적함수의 시각별 예측 손실값이 저장되지 않음',
+    'recompute_jnet_delta': '재산출 전 X0와 재산출 후 X1의 j_net이 저장되지 않음',
+    'recompute_convergence_ratio': 'X0/X1/X2 회차별 j_net이 저장되지 않음',
+    'recompute_max_p_shift': 'X0/X1 시나리오별 스케줄 차이가 저장되지 않음',
+    'coef_cache_hit_rate': 'PSO 실행 중 loss_coeffs.cache_info 결과가 runs.csv에 저장되지 않음',
+    'coef_unique_bs_count': 'PSO 실행 중 고유 (b,S) 집계가 저장되지 않음',
+    'coef_runpp_total': 'PSO 실행 중 계수측정 runpp 누적값이 저장되지 않음',
+    'coef_measure_wall_s': '계수측정 벽시계 시간이 저장되지 않음',
+    'max_lindistflow_ac_voltage_err': 'lower_lp가 시각별 LinDistFlow 전압을 반환하지 않음',
+    'mu_penalty_active': 'lower_lp가 시각·버스별 μ 페널티 활성 상태를 반환하지 않음',
+}
+
+
+def _daily_money(delta_mw, scenario):
+    return (
+        float(np.sum(np.asarray(delta_mw) * np.asarray(PM.SMP_PER_MWH[scenario])))
+        * PM.DT_HOURS
+    )
+
+
+def _diagnostic_metrics(
+    installed,
+    schedules,
+    rows,
+    slack_base,
+    slack_ess,
+    slack_ess_qzero,
+    detail,
+    best,
+):
+    """8절 그룹 A/B 지표를 최적해 재현 자료에서 집계하고 그룹 C는 NaN으로 남긴다."""
+    metrics = {name: float('nan') for name in GROUP_C_MISSING_REASONS}
+    for name in (
+        'recompute_jnet_delta',
+        'recompute_convergence_ratio',
+        'recompute_max_p_shift',
+        'coef_cache_hit_rate',
+        'coef_runpp_total',
+        'coef_unique_bs_count',
+        'coef_measure_wall_s',
+    ):
+        if best is not None and best.get(name) is not None:
+            metrics[name] = float(best[name])
+    if not rows or detail is None:
+        return metrics
+
+    q_values = np.asarray([float(row['q_mvar']) for row in rows], dtype=float)
+    q_abs = np.abs(q_values)
+    q_to_s = np.asarray([
+        abs(float(row['q_mvar'])) / float(row['s_rated'])
+        for row in rows if float(row['s_rated']) > 0.0
+    ], dtype=float)
+    util = np.asarray([
+        float(row['s_utilization']) for row in rows
+        if np.isfinite(float(row['s_utilization']))
+    ], dtype=float)
+    binding = np.asarray([bool(row['poly_binding']) for row in rows], dtype=bool)
+
+    metrics.update(
+        q_sum_mvar=float(np.sum(q_abs)),
+        q_nonzero_hours=int(np.count_nonzero(q_abs > Q_NONZERO_TOL_MVAR)),
+        q_median_mvar=float(np.median(q_abs)),
+        q_max_mvar=float(np.max(q_values)),
+        q_min_mvar=float(np.min(q_values)),
+        q_to_s_ratio=float(np.median(q_to_s)) if q_to_s.size else float('nan'),
+        poly_binding_frac=float(np.mean(binding)) if binding.size else float('nan'),
+        s_util_median=float(np.median(util)) if util.size else float('nan'),
+        s_util_max=float(np.max(util)) if util.size else float('nan'),
+        s_util_high_hours=int(np.count_nonzero(util >= POLY_BINDING_UTIL_THRESHOLD)),
+    )
+
+    for scenario in PM.AVG_DAYS:
+        metrics[f'q_contrib_{scenario}'] = (
+            float(sum(np.sum(np.abs(schedules[scenario][i][2]))
+                      for i in range(len(installed))))
+            * PM.DT_HOURS
+        )
+
+    peak_day = detail['peak_day']
+    adjusted_season = detail['adjusted_season']
+    metrics['q_contrib_peak'] = (
+        float(sum(np.sum(np.abs(schedules[peak_day][i][2]))
+                  for i in range(len(installed))))
+        * PM.DT_HOURS
+    )
+
+    pcs_loss_daily_won = {}
+    for scenario in PM.ALL_DAYS:
+        loss_pcs_mw = np.zeros(PM.TIME_STEPS, dtype=float)
+        for i in range(len(installed)):
+            p_net = np.asarray(schedules[scenario][i][0])
+            q_mvar = np.asarray(schedules[scenario][i][2])
+            loss_pcs_mw += (
+                (1.0 - PM.ETA_PCS)
+                * (np.hypot(p_net, q_mvar) - np.abs(p_net))
+            )
+        pcs_loss_daily_won[scenario] = _daily_money(loss_pcs_mw, scenario)
+    metrics['pcs_loss_annual_won'] = sum(
+        (float(PM.N_WEEKDAYS[s]) - (1.0 if s == adjusted_season else 0.0))
+        * pcs_loss_daily_won[s]
+        for s in PM.AVG_DAYS
+    ) + pcs_loss_daily_won[peak_day]
+
+    metrics['peak_day_energy_benefit'] = float(detail['b_energy_peak_day'])
+    metrics['peak_day_defer_benefit'] = (
+        PM.C_CAP_PER_MW_YR
+        * (
+            float(np.max(slack_base[peak_day]))
+            - float(np.max(slack_ess[peak_day]))
+        )
+    )
+
+    v_lindistflow_sq = detail.get('v_lindistflow_sq')
+    v_ac = detail.get('v_ac')
+    if v_lindistflow_sq is not None and v_ac is not None:
+        voltage_errors = []
+        mu_active = False
+        for scenario in PM.ALL_DAYS:
+            v_sq = np.asarray(v_lindistflow_sq[scenario], dtype=float)
+            v_ldf = np.sqrt(np.maximum(v_sq, 0.0))
+            v_ac_s = np.asarray(v_ac[scenario], dtype=float)
+            voltage_errors.append(float(np.max(np.abs(v_ldf - v_ac_s))))
+            mu_active = bool(
+                mu_active
+                or np.any(v_sq < PM.V_SQ_MIN)
+                or np.any(v_sq > PM.V_SQ_MAX)
+            )
+        metrics['max_lindistflow_ac_voltage_err'] = max(voltage_errors)
+        metrics['mu_penalty_active'] = mu_active
+
+    if slack_ess_qzero is not None:
+        q_daily = {
+            s: _daily_money(
+                np.asarray(slack_ess_qzero[s]) - np.asarray(slack_ess[s]), s
+            )
+            for s in PM.ALL_DAYS
+        }
+        b_loss_q = sum(
+            (float(PM.N_WEEKDAYS[s]) - (1.0 if s == adjusted_season else 0.0))
+            * q_daily[s]
+            for s in PM.AVG_DAYS
+        ) + q_daily[peak_day]
+        b_loss_total = float(detail['b_loss_total'])
+        b_loss_p = b_loss_total - b_loss_q
+
+        p_contrib = []
+        for s in PM.AVG_DAYS:
+            weight = (
+                float(PM.N_WEEKDAYS[s])
+                - (1.0 if s == adjusted_season else 0.0)
+            )
+            actual_loss_day = _daily_money(
+                np.asarray(evaluate._BASE_FLOW['loss'][s])
+                - np.asarray(detail['loss_ess'][s]),
+                s,
+            )
+            p_contrib.append(weight * (actual_loss_day - q_daily[s]))
+        peak_loss_day = _daily_money(
+            np.asarray(evaluate._BASE_FLOW['loss'][peak_day])
+            - np.asarray(detail['loss_ess'][peak_day]),
+            peak_day,
+        )
+        p_contrib.append(peak_loss_day - q_daily[peak_day])
+
+        gross = float(detail['b_energy'] + detail['b_defer'])
+        metrics.update(
+            b_loss_q=b_loss_q,
+            b_loss_p=b_loss_p,
+            _b_loss_total_reference=b_loss_total,
+            b_loss_q_share_of_gross_pct=(
+                100.0 * b_loss_q / gross if gross != 0.0 else float('nan')
+            ),
+            b_loss_p_negative=bool(b_loss_p < 0.0),
+            b_loss_p_min=float(min(p_contrib)),
+        )
+    else:
+        metrics.update(
+            b_loss_q=float('nan'),
+            b_loss_p=float('nan'),
+            b_loss_q_share_of_gross_pct=float('nan'),
+            b_loss_p_negative='',
+            b_loss_p_min=float('nan'),
+        )
+    return metrics
+
+
 def section9_schedule_raw(group, best, operating, schedules, base_p_sum, out_dir, ts):
     section(f"(9) 스케줄 원자료 저장 - n_ess={group['n_ess']}")
     installed = operating['installed']
 
-    slack_base, slack_ess = get_slack_via_evaluate(operating['units'], group['n_ess'])
+    slack_base, slack_ess, detail = get_slack_via_evaluate(
+        operating['units'], group['n_ess']
+    )
     slack_ess_qzero = compute_slack_qzero(installed, schedules)
     if slack_ess_qzero is not None and slack_ess is not None:
         q_only_mw = sum(float(np.sum(slack_ess_qzero[s] - slack_ess[s])) for s in PM.ALL_DAYS)
@@ -1130,12 +1377,48 @@ def section9_schedule_raw(group, best, operating, schedules, base_p_sum, out_dir
             print(f'    {s:12s} unit{i}(b={b}): SOC[0]={soc[0]:.6f} SOC[24]={soc[-1]:.6f} '
                   f'diff={soc[-1] - soc[0]:+.2e}', flush=True)
 
-    rows = build_schedule_rows(installed, schedules, base_p_sum, slack_base, slack_ess,
-                                slack_ess_qzero)
+    rows = build_schedule_rows(
+        installed,
+        schedules,
+        base_p_sum,
+        slack_base,
+        slack_ess,
+        slack_ess_qzero,
+        detail,
+    )
+    metrics = _diagnostic_metrics(
+        installed,
+        schedules,
+        rows,
+        slack_base,
+        slack_ess,
+        slack_ess_qzero,
+        detail,
+        best,
+    )
+    print('\n  8절 6차 신규 지표(최적해 기준):', flush=True)
+    for name, value in metrics.items():
+        if name not in GROUP_C_MISSING_REASONS and not name.startswith('_'):
+            print(f'    {name}={value}', flush=True)
+    print('  그룹 C 결측:', flush=True)
+    missing_count = 0
+    for name, reason in GROUP_C_MISSING_REASONS.items():
+        value = metrics.get(name)
+        if isinstance(value, float) and np.isnan(value):
+            missing_count += 1
+            print(f'    {name}=NaN — {reason}', flush=True)
+    if missing_count == 0:
+        print('    없음', flush=True)
+
     path = os.path.join(out_dir, f"schedule_n{group['n_ess']}_{ts}.csv")
     _write_csv(path, SCHEDULE_FIELDS, rows)
     print(f'\n  CSV 저장: {path} ({len(rows)}행)', flush=True)
-    return dict(path=path, n_rows=len(rows), has_slack=(slack_base is not None))
+    return dict(
+        path=path,
+        n_rows=len(rows),
+        has_slack=(slack_base is not None),
+        metrics=metrics,
+    )
 
 
 # ============================================================
@@ -1277,6 +1560,26 @@ def _incentive_conflict_label(corr):
     return 'conflict'
 
 
+DIAGNOSTIC_SUMMARY_FIELDS = [
+    'q_sum_mvar', 'q_nonzero_hours', 'q_median_mvar', 'q_max_mvar',
+    'q_min_mvar', 'q_to_s_ratio',
+    *[f'q_contrib_{scenario}' for scenario in PM.AVG_DAYS],
+    'q_contrib_peak',
+    'pcs_loss_annual_won',
+    'poly_binding_frac',
+    's_util_median', 's_util_max', 's_util_high_hours',
+    'peak_day_energy_benefit', 'peak_day_defer_benefit',
+    'b_loss_q', 'b_loss_p', 'b_loss_q_share_of_gross_pct',
+    'b_loss_p_negative', 'b_loss_p_min',
+    'qp_loss_model_err_max', 'qp_loss_model_err_mean',
+    'recompute_jnet_delta', 'recompute_convergence_ratio',
+    'recompute_max_p_shift',
+    'coef_cache_hit_rate', 'coef_unique_bs_count',
+    'coef_runpp_total', 'coef_measure_wall_s',
+    'max_lindistflow_ac_voltage_err', 'mu_penalty_active',
+]
+
+
 RUN_SUMMARY_FIELDS = [
     'n_ess', 'n_runs', 'n_degenerate',
     # ③ median을 주값으로 유지, mean을 옆에 병기(_mean). degenerate 기본 제외, _all=전체 포함.
@@ -1302,6 +1605,8 @@ RUN_SUMMARY_FIELDS = [
     # ③ 유인충돌 판정(대표 활성 기 기준, 계절 내 corr) - CLAUDE.md 8절-7
     'incentive_conflict_summer', 'incentive_conflict_winter',
     'total_negative_bdefer', 'min_bdefer_overall',
+    # 8절 6차 신규 지표. 기존 필드의 순서·이름은 유지하고 끝에만 추가한다.
+    *DIAGNOSTIC_SUMMARY_FIELDS,
 ]
 
 
@@ -1329,6 +1634,9 @@ def build_run_summary_row(result):
     gn = decomp['gross_normal'] if decomp else None
     ga = decomp['gross_all'] if decomp else None
     corr_summer, corr_winter = _representative_active_unit_corr(result)
+    diagnostic = (
+        (result.get('schedule9') or {}).get('metrics') or {}
+    )
 
     return dict(
         n_ess=g['n_ess'], n_runs=len(g['runs']),
@@ -1373,6 +1681,10 @@ def build_run_summary_row(result):
         incentive_conflict_winter=_incentive_conflict_label(corr_winter),
         total_negative_bdefer=neg_bdefer.get('total_negative', ''),
         min_bdefer_overall=neg_bdefer.get('overall_min', ''),
+        **{
+            field: diagnostic.get(field, '')
+            for field in DIAGNOSTIC_SUMMARY_FIELDS
+        },
     )
 
 

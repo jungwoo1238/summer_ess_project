@@ -1,10 +1,10 @@
-"""하위 LP (CLAUDE.md 2절, 부록C - LinDistFlow 본체 편입, C.6-3/C.6-4).
+"""하위 QP (CLAUDE.md 2-B절·3-C절, LinDistFlow 전압 + 5계수 손실).
 
 ★ 다수기 n대를 하나의 조인트 LP로 푼다(단일기 루프가 아니다). 이유: LinDistFlow 전압
 유도항(부록C.4-(1))은 버스별 전압이 "그 버스 하류의 전 기 주입 합"에 의존하므로, 기별로
 LP를 따로 풀면 다른 기의 주입을 볼 수 없다 - n기를 한 조류식으로 묶어야 한다(부록C.4 서두).
-solve_avg: AVG_DAYS 조달비 대리 최소화. solve_peak: PEAK_DAYS **시스템 전체** 피크 pk
-최소화(2절/7-A절 "기수 축 d* 중복적용" 결함 해소 - 통합 solve_peak, C.6-3 3절).
+solve_avg: AVG_DAYS 조달비 대리 + 5계수 손실비용 최소화.
+solve_peak: PEAK_DAYS **시스템 전체** 손실 1차근사 포함 피크 pk 최소화.
 
 정식화 자산(scripts/test_lindistflow.py 게이트 실측 검증 완료, 2026-07-23 - 재유도 금지):
   V^2 원형 변수, Baran-Wu load-positive 부호규약(P_ij = 하류부하 - 하류발전, 통상 양수),
@@ -17,21 +17,20 @@ solve_avg: AVG_DAYS 조달비 대리 최소화. solve_peak: PEAK_DAYS **시스�
 제약 판정은 여전히 사후 AC 조류계산 + evaluate.py의 LAMBDA_V가 담당한다(변경 없음).
 ★ v는 V^2 공간이므로 페널티 임계도 V_SQ_MIN/V_SQ_MAX(제곱값)를 쓴다.
 
-PCS 원 제약: force_q_zero=False(기본, 시변 Q 자유)일 때는 다각형 내접 근사(부록C.4-(2),
-POLY_N=12, QCP/SOCP 회피 - LP 유지)를 P_ch<=S/P_dis<=S(개별 PCS 출력한계, Q 무관하게
+PCS 원 제약: force_q_zero=False(기본, 시변 Q 자유)일 때는 다각형 내접 근사(2-B.4,
+POLY_N=128, QCP/SOCP 회피 - QP 유지)를 P_ch<=S/P_dis<=S(개별 PCS 출력한계, Q 무관하게
 항상 성립)와 **함께** 건다. force_q_zero=True(C.6-4 회귀검증·8절-6 대체용)일 때는
 Q==0을 강제하고 다각형은 걸지 않는다 - Q=0이면 sqrt(P^2+Q^2)<=S가 이미 |P|<=S와 대수적으로
 동치이므로(2절 원 구단, 편입 전 lower_lp.py 모듈 docstring과 동일 논거) 다각형 근사가
 필요 없고, 오히려 다각형을 걸면 cos(pi/12)만큼 불필요하게 좁아져 **편입 전(P_ch<=S,
 P_dis<=S만 있던 시절) 결과와의 정확한 수치 일치가 깨진다**(C.6-4 회귀검증 요구사항).
 
-성능: cvxpy Parameter 기반 DPP로 (kind, n, force_q_zero, eta_c, eta_d, self_discharge,
-soc_init, soc_min, soc_max)별 Problem을 최초 호출 시 1회만 만들고 캐싱한다(부록C.4-(4), C.5).
-S/E/버스배치(bus_onehot)/SMP/부하(profile)/mu_volt는 Parameter라 평가마다 재컴파일 없이
-.value만 갱신한다 - eta_c 등 물리상수는 나눗셈에 쓰여 Parameter화하면 DPP가 깨지므로
-(Parameter로 나누는 것은 affine이 아님) 캐시 키에 포함하는 쪽을 택했다(실전에서는 항상
-PM 기본값 하나만 쓰이므로 캐시가 늘어나지 않는다 - 물리상수를 바꿔 부르는 것은 test_lp.py뿐).
+5계수는 numpy float 상수로 문제에 굽고 SHA-256 해시를 Problem 캐시 키에 포함한다.
+S/E/버스배치/SMP/부하는 Parameter로 유지해 동일 계수 재방문 시 재컴파일 없이 값만
+교체한다. 계수가 바뀌면 해시가 달라져 반드시 새 Problem을 빌드한다.
 """
+
+import hashlib
 
 import numpy as np
 import cvxpy as cp
@@ -122,20 +121,85 @@ def base_load_bus_arrays():
 
 
 # ============================================================
-# 1. 조인트 LP 문제 구성 (n기 공통 골격) + Problem 캐시 (DPP, 부록C.4-(4))
+# 1. 조인트 QP 문제 구성 (n기 공통 골격) + 계수 해시 Problem 캐시
 # ============================================================
 
 _PROBLEM_CACHE = {}
+_COEFF_KEYS = ('a_P', 'a_Q', 'b_PP', 'b_QQ', 'b_PQ')
+_PSD_TOL = 1e-9
+_P_LOSS_ASSERT_TOL = 1e-8
 
 
 def _cache_key(kind, n, force_q_zero, eta_c, eta_d, self_discharge, soc_init, soc_min, soc_max,
-                mu_volt):
+                mu_volt, coeffs_hash):
     return (kind, int(n), bool(force_q_zero), float(eta_c), float(eta_d),
-            float(self_discharge), float(soc_init), float(soc_min), float(soc_max), float(mu_volt))
+            float(self_discharge), float(soc_init), float(soc_min), float(soc_max),
+            float(mu_volt), str(coeffs_hash))
+
+
+def _normalize_coeffs(coeffs, n, T=None):
+    """손실 5계수를 float64 (n,T) 상수 배열로 정규화한다.
+
+    n=1일 때만 (T,) 입력을 허용한다. 계수는 cvxpy Parameter가 아니며, 반환 배열은
+    C-contiguous 복사본이라 해시와 QP 상수 행렬이 호출자 측 후속 변경의 영향을 받지 않는다.
+    """
+    if T is None:
+        T = PM.TIME_STEPS
+    assert isinstance(coeffs, dict), 'coeffs는 5계수 dict여야 함'
+    missing = set(_COEFF_KEYS) - set(coeffs)
+    extra = set(coeffs) - set(_COEFF_KEYS)
+    assert not missing and not extra, \
+        f'coeffs 키 불일치: missing={sorted(missing)}, extra={sorted(extra)}'
+
+    normalized = {}
+    for name in _COEFF_KEYS:
+        arr = np.asarray(coeffs[name], dtype=np.float64)
+        if arr.shape == (T,) and n == 1:
+            arr = arr.reshape(1, T)
+        assert arr.shape == (n, T), \
+            f"coeffs['{name}'] shape {arr.shape} != ({n},{T})"
+        assert np.all(np.isfinite(arr)), f"coeffs['{name}']에 NaN/inf 존재"
+        normalized[name] = np.ascontiguousarray(arr.copy())
+    return normalized
+
+
+def _coeffs_hash(coeffs):
+    """정규화된 계수의 결정적 SHA-256 해시. 캐시 stale 재사용을 구조적으로 차단한다."""
+    digest = hashlib.sha256()
+    for name in _COEFF_KEYS:
+        arr = coeffs[name]
+        digest.update(name.encode('ascii'))
+        digest.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        digest.update(arr.tobytes(order='C'))
+    return digest.hexdigest()
+
+
+def _build_h_full(coeffs, n, T=None):
+    """시각별 길이 2n 변수용 블록대각 H_full 상수와 전역 최소고유값을 만든다."""
+    if T is None:
+        T = PM.TIME_STEPS
+    matrices = []
+    min_eig = np.inf
+    for t in range(T):
+        H = np.zeros((2 * n, 2 * n), dtype=np.float64)
+        for i in range(n):
+            p = 2 * i
+            H[p, p] = coeffs['b_PP'][i, t]
+            H[p + 1, p + 1] = coeffs['b_QQ'][i, t]
+            cross = 0.5 * coeffs['b_PQ'][i, t]
+            H[p, p + 1] = cross
+            H[p + 1, p] = cross
+        H = 0.5 * (H + H.T)
+        eig_min_t = float(np.linalg.eigvalsh(H)[0])
+        min_eig = min(min_eig, eig_min_t)
+        assert eig_min_t >= -_PSD_TOL, \
+            f'H_full 비PSD: t={t}, lambda_min={eig_min_t:.12g}'
+        matrices.append(H)
+    return tuple(matrices), float(min_eig)
 
 
 def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
-                    soc_init, soc_min, soc_max, mu_volt):
+                    soc_init, soc_min, soc_max, mu_volt, coeffs):
     # ★ mu_volt는 Parameter가 아니라 빌드시 상수로 굽는다(캐시 키에 포함). 이유(실측):
     # v_nonslack이 이미 bus_onehot/load_p_bus/load_q_bus(다른 Parameter)를 내부에 물고 있는
     # convex 표현식이라, 그 위에 또 다른 Parameter(mu_volt)를 곱하면 cvxpy DPP가 위반된다
@@ -145,6 +209,9 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
     # mu_volt=0.0 회귀검증뿐이다(그 경우 한 번 더 빌드되는 비용은 무시할 만함).
     T = PM.TIME_STEPS
     dt = PM.DT_HOURS
+    # coeffs는 solve_avg/solve_peak 진입점에서 이미 한 번 정규화·복사된 배열이다.
+    # 내부 캐시/빌드 경로에서는 재복사하지 않아 측정계수별 QP 생성 비용을 줄인다.
+    H_full, h_full_min_eig = _build_h_full(coeffs, n, T)
     topo = _get_topology()
     D, r_pu, x_pu = topo['D'], topo['r_pu'], topo['x_pu']
     n_bus, n_branch = topo['n_bus'], topo['n_branch']
@@ -213,15 +280,35 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
 
     params = dict(S=S_param, E=E_param, bus_onehot=bus_onehot,
                   load_p_bus=load_p_bus, load_q_bus=load_q_bus)
-    varset = dict(P_ch=P_ch, P_dis=P_dis, Q=Q, soc=soc, P_net=P_net)
+    # v는 이미 문제에 포함된 affine 표현식이다. varset에 참조를 보관하는 것은 문제 구조,
+    # DPP, 캐시 키를 바꾸지 않으며 solve 후 진단 경로에서 .value만 읽게 한다.
+    varset = dict(
+        P_ch=P_ch, P_dis=P_dis, Q=Q, soc=soc, P_net=P_net,
+        v_lindistflow_sq=v,
+    )
 
     if kind == 'avg':
-        smp_param = cp.Parameter(T)
+        smp_param = cp.Parameter(T, nonneg=True)
         # EPS_REG 정규화항(1e-6): SMP 평탄 등으로 목적함수가 degenerate해질 때 동시충방전
         # 해를 배제한다(주 목적함수 대비 6자리 작아 정상 차익거래 최적해는 왜곡하지 않음 -
         # 편입 전 solve_avg와 동일 논거).
+        loss_cost = 0
+        for t in range(T):
+            z_t = cp.hstack([
+                component
+                for i in range(n)
+                for component in (P_net[i, t], Q[i, t])
+            ])
+            linear_t = cp.sum(
+                cp.multiply(coeffs['a_P'][:, t], P_net[:, t])
+                + cp.multiply(coeffs['a_Q'][:, t], Q[:, t])
+            )
+            loss_cost += smp_param[t] * (
+                linear_t + cp.quad_form(z_t, H_full[t])
+            ) * dt
         objective_expr = (
             cp.sum(cp.multiply(cp.reshape(smp_param, (1, T), order='C'), P_ch - P_dis)) * dt
+            + loss_cost
             + 1e-6 * cp.sum(P_ch + P_dis)
             + volt_penalty
         )
@@ -230,7 +317,14 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
     elif kind == 'peak':
         load_total_param = cp.Parameter(T)
         pk = cp.Variable()
-        constraints.append(pk >= load_total_param - cp.sum(P_net, axis=0))
+        loss_reduction = -cp.sum(
+            cp.multiply(coeffs['a_P'], P_net)
+            + cp.multiply(coeffs['a_Q'], Q),
+            axis=0,
+        )
+        constraints.append(
+            pk >= load_total_param - cp.sum(P_net, axis=0) - loss_reduction
+        )
         objective_expr = pk + volt_penalty
         problem = cp.Problem(cp.Minimize(objective_expr), constraints)
         params['load_total'] = load_total_param
@@ -238,25 +332,51 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
     else:
         raise ValueError(f'알 수 없는 kind: {kind}')
 
-    assert problem.is_dcp(dpp=True), f'{kind} 문제가 DPP가 아님 (n={n}, force_q_zero={force_q_zero})'
-    return dict(problem=problem, params=params, vars=varset)
+    assert problem.is_dcp(dpp=True), (
+        f'{kind} 문제가 DPP가 아님 '
+        f'(n={n}, force_q_zero={force_q_zero}, '
+        f'H_full_lambda_min={h_full_min_eig:.12g})'
+    )
+    return dict(
+        problem=problem, params=params, vars=varset,
+        coeffs=coeffs, h_full=H_full,
+        h_full_min_eig=h_full_min_eig,
+        is_dcp_dpp=problem.is_dcp(dpp=True),
+    )
 
 
 def _get_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge, soc_init, soc_min, soc_max,
-                  mu_volt):
+                  mu_volt, coeffs):
+    """정규화된 coeffs의 해시로 캐시를 조회한다(재정규화·재복사 없음)."""
+    coeffs_hash = _coeffs_hash(coeffs)
     key = _cache_key(kind, n, force_q_zero, eta_c, eta_d, self_discharge, soc_init, soc_min, soc_max,
-                      mu_volt)
+                      mu_volt, coeffs_hash)
     entry = _PROBLEM_CACHE.get(key)
     if entry is None:
         entry = _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
-                                soc_init, soc_min, soc_max, mu_volt)
+                                soc_init, soc_min, soc_max, mu_volt, coeffs)
+        entry['coeffs_hash'] = coeffs_hash
         _PROBLEM_CACHE[key] = entry
     return entry
 
 
-def _check_solved(prob, name):
-    if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-        raise RuntimeError(f'{name}: LP 미해결 (status={prob.status})')
+def _solve_qp(prob, name):
+    """QP 프로토타입에서 확정한 솔버 순서로 풀고, 실패 이력을 보존한다."""
+    attempts = (
+        ('CLARABEL', dict(solver=cp.CLARABEL, max_iter=2000)),
+        ('SCS', dict(solver=cp.SCS, max_iters=100000, eps=1e-6)),
+    )
+    history = []
+    for solver_name, kwargs in attempts:
+        try:
+            prob.solve(**kwargs)
+            history.append(f'{solver_name}:{prob.status}')
+        except Exception as exc:
+            history.append(f'{solver_name}:exception={type(exc).__name__}:{exc}')
+            continue
+        if prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            return solver_name
+    raise RuntimeError(f"{name}: QP 미해결 ({'; '.join(history)})")
 
 
 # ============================================================
@@ -349,33 +469,50 @@ def _prepare_common(S_mva, E_mwh, bus_idx, profile, self_discharge, soc_init):
     return n, S, E, onehot, load_p_bus_val, load_q_bus_val
 
 
+def _assert_peak_p_loss_sign(p_net, coeffs, tol=_P_LOSS_ASSERT_TOL):
+    """시스템 합이 방전인 시각에 P 손실저감항의 부호만 검증한다(Q항은 의도적으로 제외)."""
+    p_net_sum = np.sum(p_net, axis=0)
+    discharge_times = np.flatnonzero(p_net_sum > tol)
+    for t in discharge_times:
+        p_loss_term = -float(np.sum(coeffs['a_P'][:, t] * p_net[:, t]))
+        assert p_loss_term > -tol, \
+            f'P 손실저감항 부호 오류 t={int(t)}: {p_loss_term:.12g}'
+    return int(discharge_times.size)
+
+
 def solve_avg(
     S_mva, E_mwh, bus_idx, smp, profile,
+    coeffs,
     *, eta_c=PM.ETA_C, eta_d=PM.ETA_D,
     self_discharge=PM.SELF_DISCHARGE_HOURLY,
     soc_init=PM.SOC_INIT_FRAC, soc_min=PM.SOC_MIN_FRAC, soc_max=PM.SOC_MAX_FRAC,
     mu_volt=PM.MU_VOLT, force_q_zero=False, assert_physics=True,
+    return_voltage=False,
 ):
-    """AVG_DAYS: 조달비(슬랙 유입 대리) 최소화 + mu_volt*전압유도항. 다수기(n) 조인트.
+    """AVG_DAYS: 조달비 + 5계수 손실 QP + mu_volt 전압유도항. 다수기(n) 조인트.
 
     S_mva/E_mwh/bus_idx: 길이 n 배열형(list/np.ndarray, 스칼라도 허용 - n=1로 승격).
-    smp: 길이 T (원/kWh, 절대값). profile: 길이 T, 해당 시나리오의 LOAD 배율
+    smp: 길이 T (원/MWh, PM.SMP_PER_MWH 규약). profile: 길이 T, 해당 시나리오의 LOAD 배율
       (LinDistFlow 버스별 부하 스케일 전용 - 조달비 목적함수와 무관. mu_volt=0이면
       이 인자의 실제 값이 최적해에 영향을 주지 않는다 - 유도항이 사라지므로).
-    반환: (P_net (n,T), Q (n,T), soc (n,T+1))
+    반환: 기본 (P_net (n,T), Q (n,T), soc (n,T+1)).
+      return_voltage=True면 마지막에 v_lindistflow_sq (n_bus,T), 단위 pu²를 추가한다.
       P_net: +방전/-충전 (MW). Q: 자유부호 (Mvar, force_q_zero면 전부 0).
       soc: MWh 절대량 (부록A #1 규약).
     """
     T = PM.TIME_STEPS
     smp = np.asarray(smp, dtype=float)
     assert smp.shape == (T,), f'smp shape {smp.shape} != ({T},)'
+    assert np.all(np.isfinite(smp)) and np.all(smp >= 0.0), \
+        'smp는 유한한 비음 배열이어야 함'
 
     n, S, E, onehot, load_p_val, load_q_val = _prepare_common(
         S_mva, E_mwh, bus_idx, profile, self_discharge, soc_init
     )
+    coeffs = _normalize_coeffs(coeffs, n, T)
 
     entry = _get_problem('avg', n, force_q_zero, eta_c, eta_d, self_discharge,
-                          soc_init, soc_min, soc_max, mu_volt)
+                          soc_init, soc_min, soc_max, mu_volt, coeffs)
     p = entry['params']
     p['S'].value = S
     p['E'].value = E
@@ -384,8 +521,7 @@ def solve_avg(
     p['load_q_bus'].value = load_q_val
     p['smp'].value = smp
 
-    entry['problem'].solve()
-    _check_solved(entry['problem'], 'solve_avg')
+    _solve_qp(entry['problem'], 'solve_avg')
 
     v = entry['vars']
     p_ch_val, p_dis_val, q_val, soc_val = v['P_ch'].value, v['P_dis'].value, v['Q'].value, v['soc'].value
@@ -394,24 +530,31 @@ def solve_avg(
         _assert_physics(p_ch_val, p_dis_val, q_val, soc_val, S, E, eta_c, eta_d, PM.DT_HOURS,
                          self_discharge, soc_init, soc_min, soc_max, force_q_zero)
 
-    return p_dis_val - p_ch_val, q_val, soc_val
+    solved = (p_dis_val - p_ch_val, q_val, soc_val)
+    if return_voltage:
+        return solved + (
+            np.asarray(v['v_lindistflow_sq'].value, dtype=float).copy(),
+        )
+    return solved
 
 
 def solve_peak(
     S_mva, E_mwh, bus_idx, load_total, profile,
+    coeffs,
     *, eta_c=PM.ETA_C, eta_d=PM.ETA_D,
     self_discharge=PM.SELF_DISCHARGE_HOURLY,
     soc_init=PM.SOC_INIT_FRAC, soc_min=PM.SOC_MIN_FRAC, soc_max=PM.SOC_MAX_FRAC,
     mu_volt=PM.MU_VOLT, force_q_zero=False, assert_physics=True,
+    return_voltage=False,
 ):
-    """PEAK_DAYS: **시스템 전체** 피크 pk = max_t(load_total[t] - Sigma_i P_net[i,t]) 최소화
-    + mu_volt*전압유도항. ★ 통합 solve_peak(C.6-3 3절) - pk가 기별로 따로가 아니라 전 기
+    """PEAK_DAYS: 손실 1차근사를 포함한 **시스템 전체** 피크 pk 최소화
+    + mu_volt*전압유도항. ★ 통합 solve_peak - pk가 기별로 따로가 아니라 전 기
     합산 기준 단일 스칼라라 2절/7-A절의 "기수 축 d* 중복적용" 결함이 구조적으로 사라진다
     (기존 분리LP는 각 기가 자기 d*까지 독립적으로 방전해 시스템 기준으로는 되갚음이
     중복 적용됐다 - probe_split.py 실측: b_defer가 0.53배로 붕괴).
 
-    ★ 주의: 반환하는 pk는 손실을 무시한 "부하단" 대리값이며, B_defer 산정에 직접 쓰지
-    말 것(2절 주의, 3절 B_defer 시그니처가 애초에 pk를 받지 않음 - benefits.b_defer 참조).
+    ★ 주의: 반환하는 pk는 손실 1차근사 대리값이며, B_defer 산정에 직접 쓰지
+    말 것(2절 주의, benefits.b_defer는 pk를 받지 않음).
     B_defer는 반드시 이 함수가 반환한 스케줄(P_net)을 사후 조류계산에 넣어 얻은 슬랙
     피크로 계산해야 한다.
 
@@ -420,7 +563,8 @@ def solve_peak(
       이름으로 명시). profile: 길이 T, LinDistFlow 버스별 부하 스케일 전용(load_total과
       독립 - 실전에서는 둘 다 base_p.sum()*LOAD[s]/LOAD[s]로 서로 정합하지만, 함수
       시그니처상으로는 별개 인자다).
-    반환: (P_net (n,T), Q (n,T), soc (n,T+1), pk (스칼라, MW))
+    반환: 기본 (P_net (n,T), Q (n,T), soc (n,T+1), pk (스칼라, MW)).
+      return_voltage=True면 마지막에 v_lindistflow_sq (n_bus,T), 단위 pu²를 추가한다.
     """
     T = PM.TIME_STEPS
     load_total = np.asarray(load_total, dtype=float)
@@ -429,9 +573,14 @@ def solve_peak(
     n, S, E, onehot, load_p_val, load_q_val = _prepare_common(
         S_mva, E_mwh, bus_idx, profile, self_discharge, soc_init
     )
+    coeffs = _normalize_coeffs(coeffs, n, T)
+    assert np.all(coeffs['a_P'] < 0.0), \
+        'a_P가 음수가 아님 — 계수 부호 오류 의심'
+    assert np.all(coeffs['a_Q'] < 0.0), \
+        'a_Q가 음수가 아님 — 계수 부호 오류 의심'
 
     entry = _get_problem('peak', n, force_q_zero, eta_c, eta_d, self_discharge,
-                          soc_init, soc_min, soc_max, mu_volt)
+                          soc_init, soc_min, soc_max, mu_volt, coeffs)
     p = entry['params']
     p['S'].value = S
     p['E'].value = E
@@ -440,8 +589,7 @@ def solve_peak(
     p['load_q_bus'].value = load_q_val
     p['load_total'].value = load_total
 
-    entry['problem'].solve()
-    _check_solved(entry['problem'], 'solve_peak')
+    _solve_qp(entry['problem'], 'solve_peak')
 
     v = entry['vars']
     p_ch_val, p_dis_val, q_val, soc_val = v['P_ch'].value, v['P_dis'].value, v['Q'].value, v['soc'].value
@@ -450,5 +598,11 @@ def solve_peak(
     if assert_physics:
         _assert_physics(p_ch_val, p_dis_val, q_val, soc_val, S, E, eta_c, eta_d, PM.DT_HOURS,
                          self_discharge, soc_init, soc_min, soc_max, force_q_zero)
+    _assert_peak_p_loss_sign(p_dis_val - p_ch_val, coeffs)
 
-    return p_dis_val - p_ch_val, q_val, soc_val, pk_val
+    solved = (p_dis_val - p_ch_val, q_val, soc_val, pk_val)
+    if return_voltage:
+        return solved + (
+            np.asarray(v['v_lindistflow_sq'].value, dtype=float).copy(),
+        )
+    return solved

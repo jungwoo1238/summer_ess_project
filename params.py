@@ -9,17 +9,21 @@ import numpy as np
 # ============================================================
 VN_KV = 22.9                # net.bus.vn_kv 스케일 대상 전압
 
-# ★ 슬랙(변전소) 전압. 2026-07 3차 개정: 1.0 -> 1.02. vm_pu=1.0에서는 ESS 미설치 기저상태가
-# 이미 전압 하한을 위반한다(Vmin=0.9407<0.95, 총 위반량 0.9169pu - scripts/probe_voltage.py
-# 실측, CLAUDE.md 1절/3-B절). 1.02는 변전소 OLTC의 통상적 탭 설정에 해당하며 이 지점부터
-# 기저 위반이 0이 된다(스윕 실측: 1.01에서 이미 0). build_net()의 slack_vm_pu 인자 기본값이며,
-# 구 값(1.0) 재현은 build_net(slack_vm_pu=1.0)으로 한다(VALIDATION_LEGACY_SLACK_1P0 참조).
+# ★ 슬랙(변전소) 전압. 2026-07 3차 개정: 1.0 -> 1.02. 2026-07-30 확정 부하
+# (S=10MVA, PF=0.95) 재검증에서도 ESS 미설치 기저 하한 위반 0, Vmin=0.9641pu가 확인됐다
+# (scripts/probe_voltage_rescale.py). build_net()의 slack_vm_pu 인자 기본값이다.
 SLACK_VM_PU = 1.02
 SLACK_BUS = 0
 N_BUS = 33
 
 TARGET_MVA = 10.0           # 상시운전용량 10,000kVA (HO-배전-기준-0015 제23조)
-K_SCALE = 2.288670          # = TARGET_MVA / hypot(case33bw 기본 P합, Q합). 유효·무효 동일 적용(역률 보존)
+TARGET_PF = 0.95            # 피더 종합 역률
+CASE33_P_MW = 3.715         # 원본 case33bw 유효부하 합
+CASE33_Q_MVAR = 2.300       # 원본 case33bw 무효부하 합
+TARGET_P_MW = TARGET_MVA * TARGET_PF
+TARGET_Q_MVAR = TARGET_MVA * np.sqrt(1.0 - TARGET_PF ** 2)
+K_P = TARGET_P_MW / CASE33_P_MW
+K_Q = TARGET_Q_MVAR / CASE33_Q_MVAR
 
 # 선로 정격 (KS C 3113, 40℃). {(from_bus, to_bus): 정격전류 A}
 LINE_RATINGS_A = {
@@ -33,20 +37,19 @@ LINE_RATING_DEFAULT_A = 222   # 나머지 5~31 (27개 선로) ACSR-OC 58mm^2
 # (= LOAD['summer_peak'][18]=1.0과 수학적으로 동일한 지점, 5절 참조) 기준 - 단
 # 'v_violation_total_scaled'만 예외로 ALL_DAYS x 24h 전체 집계값이다(evaluate.py 페널티
 # 정의와 동일 - CLAUDE.md 7절). 슬랙 전압 1.02(SLACK_VM_PU) 기준, 2026-07 3차 재산출
-# (scripts/probe_voltage.py 실측 - measurement1/measurement3 값과 정확히 일치 확인됨).
+# (scripts/probe_voltage_rescale.py의 확정 부하 실측값으로 2026-07-30 갱신).
 VALIDATION = {
     'loss_kw_orig_12_66kv': 202.68,   # 원본 12.66kV(스케일링 이전) - 슬랙전압과 무관, 불변
-    'loss_kw_scaled': 296.86,
-    'vmin_pu_scaled': 0.9620,
+    'loss_kw_scaled': 281.25,
+    'vmin_pu_scaled': 0.9641,
     'vmin_bus': 17,
-    'line0_current_a_scaled': 255.99,
-    'max_line_utilization_scaled': 0.6244,
+    'line0_current_a_scaled': 255.23,
+    'max_line_utilization_scaled': 0.6225,
     'v_violation_total_scaled': 0.0,   # ALL_DAYS x 24h 집계 (스냅샷 아님 - 위 설명 참조)
 }
 
-# 구 슬랙 전압(1.0, 2026-07 3차 개정 이전 기본값) 기준 회귀용 검증값. CLAUDE.md 1절 표 참조.
-# build_net(slack_vm_pu=1.0)으로 재현 확인(test_evaluate.py::test_base_violation_at_legacy_slack).
-# 위 VALIDATION과 키 구성이 같다(단 'loss_kw_orig_12_66kv'는 슬랙전압 무관이라 여기 없음).
+# 구 부하(PF=0.850241)·구 슬랙 전압(1.0) 조합의 역사적 검증값. CLAUDE.md 1절 표 참조.
+# 확정 부하(PF=0.95)의 vm_pu=1.0 회귀값이 아니므로 현 build_net() 검증에는 사용하지 않는다.
 VALIDATION_LEGACY_SLACK_1P0 = {
     'loss_kw_scaled': 310.06,
     'vmin_pu_scaled': 0.9407,
@@ -87,8 +90,8 @@ ETA_D = 0.9487                # 방전효율
 # ★ 유효전력 경로의 PCS 손실은 RTE 0.90(ETA_C*ETA_D, 시스템 레벨 AC-to-AC 효율)에 이미
 # 포함돼 있다 - 이 상수는 benefits.loss_pcs()에서 "무효전력이 유발한 증분 손실"에만 쓰인다
 # (이중계상 방지 - Loss_pcs=(1-ETA_PCS)*[sqrt(P^2+Q^2)-|P|], Q=0이면 정확히 0).
-# 잠정값 0.97 - 통상적 유틸리티급 PCS 효율. 출처 확정 후 값만 교체.
-ETA_PCS = 0.97
+# Power Electronics Freesun HEM datasheet CEC 효율 97.53%(MV 변압기 포함)에 근거한 확정값.
+ETA_PCS = 0.975
 
 SELF_DISCHARGE_DAILY = 0.00067                                     # /day
 SELF_DISCHARGE_HOURLY = 1 - (1 - SELF_DISCHARGE_DAILY) ** (1 / 24)  # 복리 정확값 (=2.7925633002e-05)
@@ -112,7 +115,7 @@ V_SQ_MAX = V_MAX ** 2                       # = 1.1025
 
 # PCS 원(circle) 제약의 다각형 내접 근사 변수 개수 (부록C.4-(2)). n=12 -> 최대 반경오차
 # 1-cos(pi/12)=3.4%, 항상 원 안쪽(보수적). QCP(SOCP) 대신 LP 유지가 목적.
-POLY_N = 32
+POLY_N = 128
 
 # ============================================================
 # 4. CRF · 비용 · 편익 확정 파라미터 (CLAUDE.md 4절, 부록B)
