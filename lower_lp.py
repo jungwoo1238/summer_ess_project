@@ -31,6 +31,7 @@ S/E/버스배치/SMP/부하는 Parameter로 유지해 동일 계수 재방문 �
 """
 
 import hashlib
+from collections import OrderedDict
 
 import numpy as np
 import cvxpy as cp
@@ -124,7 +125,8 @@ def base_load_bus_arrays():
 # 1. 조인트 QP 문제 구성 (n기 공통 골격) + 계수 해시 Problem 캐시
 # ============================================================
 
-_PROBLEM_CACHE = {}
+_PROBLEM_CACHE_MAXSIZE = PM.PROBLEM_CACHE_MAXSIZE
+_PROBLEM_CACHE = OrderedDict()
 _COEFF_KEYS = ('a_P', 'a_Q', 'b_PP', 'b_QQ', 'b_PQ')
 _PSD_TOL = 1e-9
 _P_LOSS_ASSERT_TOL = 1e-8
@@ -254,13 +256,23 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
     P_net = P_dis - P_ch  # (n,T) affine, +방전/-충전
 
     # ---- PCS 원 제약: force_q_zero면 정확히 Q=0(다각형 불필요), 아니면 다각형 내접 근사 ----
+    pcs_loss_mw = None
     if force_q_zero:
         constraints.append(Q == 0)
     else:
+        # Polygon support-function lower bound of sqrt(P_net^2 + Q^2).
+        # The angles are exactly the same as the existing PCS polygon, so the
+        # loss approximation and the capacity constraint share one geometry.
+        pcs_u = cp.Variable((n, T))
         s_cap = S_col * float(np.cos(np.pi / PM.POLY_N))
         for k in range(PM.POLY_N):
             theta = 2.0 * np.pi * k / PM.POLY_N
-            constraints.append(P_net * float(np.cos(theta)) + Q * float(np.sin(theta)) <= s_cap)
+            lhs_k = P_net * float(np.cos(theta)) + Q * float(np.sin(theta))
+            constraints.append(lhs_k <= s_cap)
+            constraints.append(pcs_u >= lhs_k)
+        # With simultaneous charge/discharge excluded, P_ch + P_dis is
+        # |P_net|.  This remains affine and therefore preserves the QP.
+        pcs_loss_mw = pcs_u - P_ch - P_dis
 
     # ---- LinDistFlow: 버스별 순부하 -> 선로조류 -> V^2 (부록C.4, Baran-Wu load-positive) ----
     # ★ MW/Mvar -> pu 변환(÷S_BASE_MVA) 필수 - r_pu/x_pu가 무차원 pu 임피던스이므로 P/Q도
@@ -286,6 +298,8 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
         P_ch=P_ch, P_dis=P_dis, Q=Q, soc=soc, P_net=P_net,
         v_lindistflow_sq=v,
     )
+    if not force_q_zero:
+        varset['pcs_u'] = pcs_u
 
     if kind == 'avg':
         smp_param = cp.Parameter(T, nonneg=True)
@@ -312,10 +326,19 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
             + 1e-6 * cp.sum(P_ch + P_dis)
             + volt_penalty
         )
+        if pcs_loss_mw is not None:
+            pcs_cost = cp.sum(
+                cp.multiply(
+                    cp.reshape(smp_param, (1, T), order='C'),
+                    pcs_loss_mw,
+                )
+            ) * (1.0 - PM.ETA_PCS) * dt
+            objective_expr += pcs_cost
         problem = cp.Problem(cp.Minimize(objective_expr), constraints)
         params['smp'] = smp_param
     elif kind == 'peak':
         load_total_param = cp.Parameter(T)
+        smp_param = cp.Parameter(T, nonneg=True)
         pk = cp.Variable()
         loss_reduction = -cp.sum(
             cp.multiply(coeffs['a_P'], P_net)
@@ -325,9 +348,46 @@ def _build_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge,
         constraints.append(
             pk >= load_total_param - cp.sum(P_net, axis=0) - loss_reduction
         )
-        objective_expr = pk + volt_penalty
+        arb_cost = cp.sum(
+            cp.multiply(
+                cp.reshape(smp_param, (1, T), order='C'),
+                P_ch - P_dis,
+            )
+        ) * dt
+        loss_cost_peak = 0
+        for t in range(T):
+            z_t = cp.hstack([
+                component
+                for i in range(n)
+                for component in (P_net[i, t], Q[i, t])
+            ])
+            linear_t = cp.sum(
+                cp.multiply(coeffs['a_P'][:, t], P_net[:, t])
+                + cp.multiply(coeffs['a_Q'][:, t], Q[:, t])
+            )
+            loss_cost_peak += smp_param[t] * (
+                linear_t + cp.quad_form(z_t, H_full[t])
+            ) * dt
+        eps_reg_peak = 1e-6 * cp.sum(P_ch + P_dis)
+        defer_cost = PM.C_CAP_PER_MW_YR * pk
+        objective_expr = (
+            defer_cost
+            + arb_cost
+            + loss_cost_peak
+            + eps_reg_peak
+            + volt_penalty
+        )
+        if pcs_loss_mw is not None:
+            pcs_cost = cp.sum(
+                cp.multiply(
+                    cp.reshape(smp_param, (1, T), order='C'),
+                    pcs_loss_mw,
+                )
+            ) * (1.0 - PM.ETA_PCS) * dt
+            objective_expr += pcs_cost
         problem = cp.Problem(cp.Minimize(objective_expr), constraints)
         params['load_total'] = load_total_param
+        params['smp'] = smp_param
         varset['pk'] = pk
     else:
         raise ValueError(f'알 수 없는 kind: {kind}')
@@ -357,6 +417,11 @@ def _get_problem(kind, n, force_q_zero, eta_c, eta_d, self_discharge, soc_init, 
                                 soc_init, soc_min, soc_max, mu_volt, coeffs)
         entry['coeffs_hash'] = coeffs_hash
         _PROBLEM_CACHE[key] = entry
+        _PROBLEM_CACHE.move_to_end(key)
+        while len(_PROBLEM_CACHE) > _PROBLEM_CACHE_MAXSIZE:
+            _PROBLEM_CACHE.popitem(last=False)
+    else:
+        _PROBLEM_CACHE.move_to_end(key)
     return entry
 
 
@@ -539,7 +604,7 @@ def solve_avg(
 
 
 def solve_peak(
-    S_mva, E_mwh, bus_idx, load_total, profile,
+    S_mva, E_mwh, bus_idx, load_total, smp, profile,
     coeffs,
     *, eta_c=PM.ETA_C, eta_d=PM.ETA_D,
     self_discharge=PM.SELF_DISCHARGE_HOURLY,
@@ -569,6 +634,10 @@ def solve_peak(
     T = PM.TIME_STEPS
     load_total = np.asarray(load_total, dtype=float)
     assert load_total.shape == (T,), f'load_total shape {load_total.shape} != ({T},)'
+    smp = np.asarray(smp, dtype=float)
+    assert smp.shape == (T,), f'smp shape {smp.shape} != ({T},)'
+    assert np.all(np.isfinite(smp)) and np.all(smp >= 0.0), \
+        'smp must be a finite nonnegative array in won/MWh'
 
     n, S, E, onehot, load_p_val, load_q_val = _prepare_common(
         S_mva, E_mwh, bus_idx, profile, self_discharge, soc_init
@@ -588,6 +657,7 @@ def solve_peak(
     p['load_p_bus'].value = load_p_val
     p['load_q_bus'].value = load_q_val
     p['load_total'].value = load_total
+    p['smp'].value = smp
 
     _solve_qp(entry['problem'], 'solve_peak')
 

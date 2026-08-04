@@ -62,6 +62,13 @@ VALIDATION_LEGACY_SLACK_1P0 = {
     'v_violation_total_scaled': 0.9169,   # ALL_DAYS x 24h 집계
 }
 
+# 현 확정 부하(P=9.5MW, Q=3.122499Mvar, PF=0.95)를 유지하고 슬랙만
+# 회귀 검사용 구 설정 1.0pu로 내린 값. test_evaluate의 위반 계산 경로 검증용이다.
+# 2026-08-03 test_evaluate 실측(ALL_DAYS x 24h x 비슬랙 버스 L1 합).
+VALIDATION_CURRENT_LOAD_SLACK_1P0 = {
+    'v_violation_total_scaled': 0.3781163378009831,
+}
+
 # ============================================================
 # 2. 상위 PSO 탐색 경계 (CLAUDE.md 2절)
 # ============================================================
@@ -116,6 +123,38 @@ V_SQ_MAX = V_MAX ** 2                       # = 1.1025
 # PCS 원(circle) 제약의 다각형 내접 근사 변수 개수 (부록C.4-(2)). n=12 -> 최대 반경오차
 # 1-cos(pi/12)=3.4%, 항상 원 안쪽(보수적). QCP(SOCP) 대신 LP 유지가 목적.
 POLY_N = 128
+
+# 손실계수 측정/캐시용 S 격자. PSO와 lower_lp solve에는 원래 연속 S를
+# 그대로 사용하고, 계수를 가장 가까운 격자 S에서 측정·재사용한다.
+# 검증 완료 확정값: j_net 영향 0.02원, 인접 S 고유 키 85.7% 감소.
+# 0.0001 MVA는 고유 키 감소가 0%라 기각했다(validate_s_quantization.py).
+S_CACHE_GRID_MVA = 0.05
+
+# 손실계수 국소 측정 그리드. min7은 96조건 조밀격자 대조에서 손실면
+# 상대오차 최악 0.054%로 검증된 기본값이다. 회귀 비교 시 full25로 복원한다.
+LOSS_GRID_DESIGN = "min7"
+
+# min7 PCS 경계 축퇴 방지용 측정중심 pull. |p_center|/S가 0.95를
+# 초과하면 측정 그리드 중심만 0.85S로 당긴다(solve·실제 운영점 불변).
+# 180조건 probe에서 축퇴는 frac=1.0의 36건에만 발생했고, 이 조합은
+# 7점 비용을 유지하면서 경계 손실면 오차 최악 약 0.036%였다.
+LOSS_PULL_THRESH = 0.95
+LOSS_PULL_TARGET = 0.85
+
+# 최적화 경로의 운영점 계수 재산출 스위치. dev gbest 실측에서 재산출의
+# 연간 j_net 영향이 약 100원(약 0.003%)이라 기본 비활성화한다.
+# True로 두면 종전 C0→X0→C1→X1 경로를 즉시 복원할 수 있다.
+RECOMPUTE_ENABLED = False
+
+# lower_lp Problem LRU 캐시 상한. S 양자화 도입으로 고유 키가 급감해
+# 작은 상한으로 충분하다. Problem 개당 약 4~20 MiB 기준, 16이면
+# 워커당 수백 MiB, 16워커 중앙 추정 약 3.8 GiB이다.
+# 64는 16워커에서 약 4~20 GiB로 메모리 초과 위험이 있어 하향한다.
+PROBLEM_CACHE_MAXSIZE = 16
+
+# 손실계수 측정 결과 LRU 캐시 상한. 엔트리는 시각별 계수·진단 스칼라로
+# Problem보다 훨씬 가벼우므로 현재 상한을 유지한다.
+MEASURED_CACHE_MAXSIZE = 65536
 
 # ============================================================
 # 4. CRF · 비용 · 편익 확정 파라미터 (CLAUDE.md 4절, 부록B)
@@ -199,7 +238,7 @@ PSO_C1 = PSO_C2 = 2.0
 PSO_V_MAX_RATIO = 0.2               # v_max = 0.2 * (hi - lo)
 
 PSO_DEV = dict(n_particles=30, n_iters=30, n_runs=3)      # 개발: 시나리오 1~2개
-PSO_MAIN = dict(n_particles=30, n_iters=100, n_runs=30)   # 본실험: 시나리오 5개
+PSO_MAIN = dict(n_particles=30, n_iters=60, n_runs=20)   # 본실험: 시나리오 5개
 
 # 페널티 (뼈대: 정적 L1). 초기값 1e10 (J_net 스케일 ~1e8원/년을 확실히 압도) -> 첫 실행 위반 스케일 관찰 후 조정.
 # (CLAUDE.md 7절: "충분히 큰 고정상수로 시작 -> 위반 스케일 관찰 후 조정")

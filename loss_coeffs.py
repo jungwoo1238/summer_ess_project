@@ -18,8 +18,10 @@ used by ``evaluate.py``.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterable
+import math
 import time
 
 import numpy as np
@@ -42,7 +44,10 @@ PF_TOLERANCE_SMALL_S_MVA = 1e-12
 PF_TOLERANCE_SMALL_S_MAX_MVA = 1e-3
 _PROBE_NAME = "LOSS_COEFF_PROBE"
 
-_measured_cache: dict[tuple[int, float, str, int, float], dict] = {}
+_MEASURED_CACHE_MAXSIZE = PM.MEASURED_CACHE_MAXSIZE
+_measured_cache: OrderedDict[
+    tuple[int, float, str, int, float], dict
+] = OrderedDict()
 _cache_hits = 0
 _cache_misses = 0
 _runpp_attempt_count = 0
@@ -61,8 +66,36 @@ class _RunStats:
 def _cache_key_coeffs(
     bus: int, S: float, scenario: str, t: int, p_center: float
 ) -> tuple[int, float, str, int, float]:
-    """Return the exact-float cache key; S is intentionally not rounded."""
-    return int(bus), float(S), str(scenario), int(t), float(p_center)
+    """Return a key whose S component is the configured measurement grid."""
+    return (
+        int(bus),
+        _quantize_s_for_cache(S),
+        str(scenario),
+        int(t),
+        float(p_center),
+    )
+
+
+def _quantize_s_for_cache(S: float, grid: float | None = None) -> float:
+    """Nearest positive S measurement grid point; grid<=0 disables quantization.
+
+    The returned value is used only to measure/cache loss coefficients.  The
+    original continuous S remains the capacity passed to ``lower_lp.solve_*``.
+    Values below half a grid step retain their raw positive S because the
+    mathematically nearest grid value zero is not a valid measurement rating.
+    """
+    S = float(S)
+    if not np.isfinite(S) or S <= 0.0:
+        raise ValueError(f"S must be finite and positive, got {S}")
+    grid = float(PM.S_CACHE_GRID_MVA if grid is None else grid)
+    if not np.isfinite(grid):
+        raise ValueError(f"S cache grid must be finite, got {grid}")
+    if grid <= 0.0:
+        return S
+    bucket = int(np.floor(S / grid + 0.5))
+    if bucket <= 0:
+        return S
+    return float(bucket * grid)
 
 
 def clear_cache() -> None:
@@ -215,7 +248,8 @@ def _network_loss_mw(net) -> float:
     return total
 
 
-def _local_grid(S: float, p_center: float) -> list[tuple[float, float]]:
+def _grid_full25(S: float, p_center: float) -> list[tuple[float, float]]:
+    """Legacy five-P by five-Q adaptive grid."""
     p_values = np.unique(np.clip(p_center + S * P_GRID, -S, S))
     grid: list[tuple[float, float]] = []
     for p_value in p_values:
@@ -227,6 +261,92 @@ def _local_grid(S: float, p_center: float) -> list[tuple[float, float]]:
             if np.hypot(p, q) <= S + GRID_TOL:
                 grid.append((p, q))
     return grid
+
+
+def _deduplicate_feasible(
+    points: Iterable[tuple[float, float]], S: float
+) -> list[tuple[float, float]]:
+    """Radially clip round-off excursions and remove duplicate PCS points."""
+    unique: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for p_raw, q_raw in points:
+        p = float(p_raw)
+        q = float(q_raw)
+        radius = float(np.hypot(p, q))
+        if radius > S:
+            scale = S / radius
+            p *= scale
+            q *= scale
+        if np.hypot(p, q) > S + GRID_TOL:
+            raise AssertionError(f"PCS-infeasible grid point: P={p}, Q={q}, S={S}")
+        key = (round(p, 14), round(q, 14))
+        if key not in seen:
+            seen.add(key)
+            unique.append((p, q))
+    return unique
+
+
+def _ccd_geometry(S: float, p_center: float) -> tuple[float, float]:
+    """Return symmetric local P radius and Q radius for a feasible CCD.
+
+    The corner constraint is evaluated for the adverse P sign (the one moving
+    away from zero), so every un-clipped point lies inside the absolute PCS
+    circle even when ``p_center`` is nonzero.
+    """
+    q_at_center = math.sqrt(max(S * S - p_center * p_center, 0.0))
+    p_axis_limit = max(S - abs(p_center), 0.0)
+    corner_p_limit = math.sqrt(2.0) * max(
+        math.sqrt(max(S * S - 0.5 * q_at_center * q_at_center, 0.0))
+        - abs(p_center),
+        0.0,
+    )
+    s_eff = min(p_axis_limit, corner_p_limit)
+    return float(s_eff), float(q_at_center)
+
+
+def _grid_min7(S: float, p_center: float) -> list[tuple[float, float]]:
+    """Seven-point lower-bound design: centre, axes, two diagonals."""
+    s_eff, q_center = _ccd_geometry(S, p_center)
+    root2 = math.sqrt(2.0)
+    points = [
+        (p_center, 0.0),
+        (p_center - s_eff, 0.0),
+        (p_center + s_eff, 0.0),
+        (p_center, -q_center),
+        (p_center, q_center),
+        (p_center + s_eff / root2, q_center / root2),
+        (p_center - s_eff / root2, -q_center / root2),
+    ]
+    return _deduplicate_feasible(points, S)
+
+
+def _pull_min7_measurement_center(S: float, p_center: float) -> float:
+    """Move only a boundary measurement centre inward; solve state is unchanged."""
+    threshold = float(PM.LOSS_PULL_THRESH)
+    target = float(PM.LOSS_PULL_TARGET)
+    if not (0.0 < target < threshold <= 1.0):
+        raise ValueError(
+            "LOSS_PULL_TARGET and LOSS_PULL_THRESH must satisfy "
+            f"0 < target < threshold <= 1, got {target}, {threshold}"
+        )
+    fraction = abs(float(p_center)) / float(S)
+    if fraction > threshold:
+        return float(math.copysign(target * float(S), float(p_center)))
+    return float(p_center)
+
+
+def _local_grid(S: float, p_center: float) -> list[tuple[float, float]]:
+    """Return the configured local loss-surface measurement grid."""
+    design = str(PM.LOSS_GRID_DESIGN).lower()
+    if design == "min7":
+        p_center_measure = _pull_min7_measurement_center(S, p_center)
+        return _grid_min7(S, p_center_measure)
+    if design == "full25":
+        return _grid_full25(S, p_center)
+    raise ValueError(
+        f"unsupported LOSS_GRID_DESIGN={PM.LOSS_GRID_DESIGN!r}; "
+        "expected 'min7' or 'full25'"
+    )
 
 
 def _measure_loss(
@@ -479,9 +599,20 @@ def get_or_measure(
     """Return cached coefficients or measure them on a cache miss."""
     global _cache_hits, _cache_misses, _measure_wall_s
     key = _cache_key_coeffs(bus, S, scenario, t, p_center)
+    S_grid = float(key[1])
+    # 순서: 연속 운영점 -> 양자화 S_grid의 PCS 원으로 클립 -> min7이면
+    # 경계 pull. solve와 실제 운영점은 바꾸지 않고 측정 그리드 중심만 옮긴다.
+    p_center_grid = float(np.clip(float(p_center), -S_grid, S_grid))
+    if str(PM.LOSS_GRID_DESIGN).lower() == "min7":
+        p_center_measure = _pull_min7_measurement_center(S_grid, p_center_grid)
+    else:
+        p_center_measure = p_center_grid
+    # 캐시 키와 실제 measure_coeffs 호출 모두 pull 후 중심을 사용한다.
+    key = _cache_key_coeffs(bus, S_grid, scenario, t, p_center_measure)
     cached = _measured_cache.get(key)
     if cached is not None:
         _cache_hits += 1
+        _measured_cache.move_to_end(key)
         result = _copy_result(cached)
         if strict:
             _enforce_strict(result)
@@ -492,16 +623,19 @@ def get_or_measure(
     try:
         result = measure_coeffs(
             bus,
-            S,
+            S_grid,
             scenario,
             t,
-            p_center,
+            p_center_measure,
             net=net,
             strict=strict,
         )
     finally:
         _measure_wall_s += time.perf_counter() - started
     _measured_cache[key] = _copy_result(result)
+    _measured_cache.move_to_end(key)
+    while len(_measured_cache) > _MEASURED_CACHE_MAXSIZE:
+        _measured_cache.popitem(last=False)
     return _copy_result(result)
 
 
@@ -572,9 +706,10 @@ def measure_coeffs_grid(
     output["scenarios"] = scenarios
     output["times"] = np.asarray(times, dtype=int)
     output["bus"] = int(bus)
-    output["S"] = float(S)
+    output["S_requested"] = float(S)
+    output["S"] = _quantize_s_for_cache(S)
     output["p_center"] = float(p_center)
-    output["pf_tolerance_mva"] = float(_pf_tolerance_mva(float(S)))
+    output["pf_tolerance_mva"] = float(_pf_tolerance_mva(output["S"]))
     return output
 
 

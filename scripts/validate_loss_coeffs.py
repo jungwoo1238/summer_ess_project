@@ -36,7 +36,7 @@ SCENARIO = "summer_peak"
 PEAK_T = int(np.argmax(np.asarray(PM.LOAD[SCENARIO], dtype=float)))
 
 
-def _stage(number: int, title: str) -> None:
+def _stage(number: int | str, title: str) -> None:
     print(f"\n[stage] {number}. {title}", flush=True)
 
 
@@ -60,6 +60,72 @@ def main() -> int:
         f"test_point bus={BUS} S={S_MVA} scenario={SCENARIO} t={PEAK_T}",
         flush=True,
     )
+
+    _stage(0, "configured local measurement grid")
+    local_grid = LC._local_grid(S_MVA, 0.5 * S_MVA)
+    expected_count = {"min7": 7, "full25": 25}[
+        str(PM.LOSS_GRID_DESIGN).lower()
+    ]
+    print(f"loss_grid_design={PM.LOSS_GRID_DESIGN}", flush=True)
+    print(f"grid_sample_count_excluding_baseline={len(local_grid)}", flush=True)
+    print(f"grid_points={local_grid}", flush=True)
+    assert len(local_grid) == expected_count, (
+        PM.LOSS_GRID_DESIGN,
+        len(local_grid),
+        expected_count,
+    )
+    assert all(
+        np.hypot(p_mw, q_mvar) <= S_MVA + LC.GRID_TOL
+        for p_mw, q_mvar in local_grid
+    )
+
+    if str(PM.LOSS_GRID_DESIGN).lower() == "min7":
+        _stage("0b", "min7 PCS-boundary pull regression")
+        boundary_grid = LC._local_grid(S_MVA, S_MVA)
+        boundary_design = np.asarray(
+            [[p, q, p * p, q * q, p * q] for p, q in boundary_grid],
+            dtype=float,
+        )
+        boundary_scale = np.max(np.abs(boundary_design), axis=0)
+        boundary_scale[boundary_scale == 0.0] = 1.0
+        boundary_grid_rank = int(
+            np.linalg.matrix_rank(boundary_design / boundary_scale)
+        )
+        expected_center = PM.LOSS_PULL_TARGET * S_MVA
+        print(f"boundary_grid_points={boundary_grid}", flush=True)
+        print(f"boundary_grid_rank={boundary_grid_rank}", flush=True)
+        print(f"boundary_pull_expected_center_mw={expected_center:.12g}", flush=True)
+        assert len(boundary_grid) == 7, len(boundary_grid)
+        assert boundary_grid_rank == 5, boundary_grid_rank
+        assert any(abs(q_mvar) > 0.0 for _, q_mvar in boundary_grid)
+
+        boundary_result = LC.measure_coeffs(
+            bus=BUS,
+            S=S_MVA,
+            scenario=SCENARIO,
+            t=PEAK_T,
+            p_center=S_MVA,
+            strict=True,
+        )
+        boundary_fit_rel_baseline = (
+            boundary_result["fit_max_abs_error_mw"]
+            / abs(boundary_result["baseline_loss_mw"])
+        )
+        print(f"boundary_fit_rank={boundary_result['fit_rank']}", flush=True)
+        print(f"boundary_a_Q={boundary_result['a_Q']:.12g}", flush=True)
+        print(
+            f"boundary_h_cost_min_eig={boundary_result['h_cost_min_eig']:.12g}",
+            flush=True,
+        )
+        print(
+            f"boundary_fit_rel_baseline={boundary_fit_rel_baseline:.12g}",
+            flush=True,
+        )
+        assert boundary_result["fit_rank"] == 5, boundary_result["fit_rank"]
+        assert boundary_result["a_Q"] < 0.0, boundary_result["a_Q"]
+        assert boundary_result["h_cost_psd"], boundary_result["h_cost_min_eig"]
+        assert boundary_fit_rel_baseline <= 5e-4, boundary_fit_rel_baseline
+        # TODO: 정확한 min7+pull 5계수 회귀값은 데스크탑 실행 결과로 확정한다.
 
     _stage(1, "coefficient sign, PSD, fit, and units")
     result = LC.measure_coeffs(
@@ -92,6 +158,8 @@ def main() -> int:
     )
     measured_l_cost = direct["L_cost_mw"]
     modeled_l_cost = _model_l_cost(result, 0.1, 0.0)
+    # TODO(min7 기준 재측정): 이 출력에 수치 기대값/허용오차를 추가하려면
+    # 데스크탑 AC 검증 결과로 확정한다. 여기서 새 임계를 창작하지 않는다.
     print(f"direct_L_cost_p0.1_q0_mw={measured_l_cost:.12g}", flush=True)
     print(f"model_L_cost_p0.1_q0_mw={modeled_l_cost:.12g}", flush=True)
     print(

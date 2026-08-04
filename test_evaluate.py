@@ -20,6 +20,7 @@ import pytest
 
 import params as PM
 import evaluate
+import loss_coeffs
 from build_net import build_net
 
 pytestmark = pytest.mark.slow
@@ -184,26 +185,30 @@ def test_base_has_no_voltage_violation():
 
 
 def test_base_violation_at_legacy_slack():
-    """구 슬랙 전압(1.0)에서는 v_violation이 0이 아니어야 한다(CLAUDE.md 1절 표,
-    PM.VALIDATION_LEGACY_SLACK_1P0 참조).
+    """현 부하에서 구 슬랙 전압(1.0)은 v_violation이 0이 아니어야 한다.
+
+    PM.VALIDATION_CURRENT_LOAD_SLACK_1P0은 부하(P=9.5MW, PF=0.95)는 현행으로
+    유지하고 슬랙만 1.0으로 내린 회귀값이다. PF=0.850241 구 부하까지 함께 쓴
+    PM.VALIDATION_LEGACY_SLACK_1P0(0.9169)과 섞지 않는다.
 
     ★ 왜 필요한가: 현행 기본값(슬랙 1.02)에서는 정상 경로의 v_violation이 test_base_has_
     no_voltage_violation을 포함해 이 파일 어디서도 항상 0이다. 위반 계산 코드가 버그로
     (예: 부호가 뒤집혀 항상 0을 반환하거나, V_MIN/V_MAX를 잘못 참조해도) 항상 0을 내놓으면
-    그 버그가 있어도 다른 모든 테스트가 그대로 통과한다. 구 슬랙(1.0)에서 실측값(probe_voltage.py,
-    0.9169pu)과 가까운 0이 아닌 값이 실제로 나오는 것을 확인해야 그 계산 경로가 살아
+    그 버그가 있어도 다른 모든 테스트가 그대로 통과한다. 현 부하·구 슬랙(1.0) 실측값
+    0.3781163378pu와 가까운 0이 아닌 값이 실제로 나오는 것을 확인해야 그 계산 경로가 살아
     있음이 보장된다 - CLAUDE.md 7절 테스트 설계 원칙 5(회귀 방지)와 같은 취지.
 
-    허용오차: PM.VALIDATION_LEGACY_SLACK_1P0의 0.9169는 probe_voltage.py 실측값(0.916866)의
-    유효숫자 4자리 반올림이라, 반올림 오차(~3.4e-5)보다 넉넉한 여유를 두어 atol=1e-3으로 둔다
-    (CLAUDE.md 7절 원칙 4 - 물리적 근거 있는 값, 임의로 조이지 않음).
+    허용오차 1e-3은 조류계산 수렴 잡음보다 충분히 크고, 위반 계산 경로의 구조적 오류는
+    검출할 만큼 작게 유지한다(CLAUDE.md 7절 원칙 4).
     """
     net = build_net(slack_vm_pu=1.0)
     base_p = net.load['p_mw'].to_numpy().copy()
     base_q = net.load['q_mvar'].to_numpy().copy()
     base_flow = evaluate._compute_base_flow(net, base_p, base_q)
 
-    expected = PM.VALIDATION_LEGACY_SLACK_1P0['v_violation_total_scaled']
+    expected = PM.VALIDATION_CURRENT_LOAD_SLACK_1P0[
+        'v_violation_total_scaled'
+    ]
     assert base_flow['v_violation'] > 0.0, \
         f"구 슬랙(1.0)에서도 v_violation=0 - 위반 계산 경로가 죽어있을 위험, 재확인 필요 ({base_flow['v_violation']})"
     assert np.isclose(base_flow['v_violation'], expected, atol=1e-3, rtol=0.0), \
@@ -346,6 +351,72 @@ def test_fitness_always_finite_scalar():
     print('test_fitness_always_finite_scalar OK')
 
 
+def test_recompute_disabled_in_optimization_but_preserved_for_diagnostics():
+    """기본 최적화는 C0/X0만, 진단과 복원 스위치는 종전 C1/X1을 유지한다."""
+    scenario = 'summer'
+    bus, S, E = 16, 0.15353, 0.43788
+    profile = np.asarray(PM.LOAD[scenario], dtype=float)
+    smp = np.asarray(PM.SMP_PER_MWH[scenario], dtype=float)
+    original_flag = PM.RECOMPUTE_ENABLED
+    original_measure = evaluate._measure_recomputed_coeffs_1unit
+    measure_calls = {'count': 0}
+
+    def counted_measure(*args, **kwargs):
+        measure_calls['count'] += 1
+        return original_measure(*args, **kwargs)
+
+    loss_coeffs.clear_cache()
+    cache_before = loss_coeffs.cache_info()
+    evaluate._measure_recomputed_coeffs_1unit = counted_measure
+    try:
+        PM.RECOMPUTE_ENABLED = False
+        solved_x0 = evaluate._solve_with_recompute(
+            'avg', bus, S, E, scenario,
+            smp=smp, profile=profile, return_intermediates=False,
+        )
+        cache_after_x0 = loss_coeffs.cache_info()
+        assert measure_calls['count'] == 0, measure_calls
+        expected_c0_runpp = PM.TIME_STEPS * (
+            1 + len(loss_coeffs._local_grid(S, 0.0))
+        )
+        retry_increment = (
+            cache_after_x0['runpp_retries'] - cache_before['runpp_retries']
+        )
+        assert (
+            cache_after_x0['runpp_attempts'] - cache_before['runpp_attempts']
+            == expected_c0_runpp + retry_increment
+        ), (cache_before, cache_after_x0, expected_c0_runpp, retry_increment)
+
+        diagnostic = evaluate._solve_with_recompute(
+            'avg', bus, S, E, scenario,
+            smp=smp, profile=profile, return_intermediates=True,
+        )
+        assert measure_calls['count'] == 2, measure_calls  # C1과 진단용 C2
+        assert 'X1' in diagnostic and 'recompute_time_diag' in diagnostic
+        for name in ('p_shift_mw', 'p_shift_frac_s', 'coef_delta_max',
+                     'jnet_delta_won'):
+            assert diagnostic['recompute_time_diag'][name].shape == (PM.TIME_STEPS,)
+
+        PM.RECOMPUTE_ENABLED = True
+        solved_legacy_x1 = evaluate._solve_with_recompute(
+            'avg', bus, S, E, scenario,
+            smp=smp, profile=profile, return_intermediates=False,
+        )
+        for actual, expected in zip(solved_legacy_x1, (
+            diagnostic['X1']['P_net'],
+            diagnostic['X1']['Q'],
+            diagnostic['X1']['soc'],
+        )):
+            assert np.allclose(actual, expected, rtol=0.0, atol=1e-8)
+        # TODO: dev 완료 후 X0 최종 j_net의 정확한 원 단위 회귀값을 확정한다.
+        _ = solved_x0
+    finally:
+        PM.RECOMPUTE_ENABLED = original_flag
+        evaluate._measure_recomputed_coeffs_1unit = original_measure
+
+    print('test_recompute_disabled_in_optimization_but_preserved_for_diagnostics OK')
+
+
 # ============================================================
 # 7. 다수기 구조 (n=1, n=2, 중복배치)
 # ============================================================
@@ -401,6 +472,7 @@ if __name__ == '__main__':
     test_realistic_particle_balance_and_decomposition()
     test_divergence_returns_penalty_not_exception()
     test_fitness_always_finite_scalar()
+    test_recompute_disabled_in_optimization_but_preserved_for_diagnostics()
     test_multi_unit_n1_and_n2_structural()
     test_and_report_single_evaluation_timing()
     print('all evaluate tests passed')

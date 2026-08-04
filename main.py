@@ -61,7 +61,7 @@ DEFAULT_N_WORKERS = 16   # scripts/bench_workers.py 실측 확정값 (아래 "�
 # 실측(확정 사항 1)에서 정수배 여부가 성능에 유의하지 않았으므로 그대로 채택.
 PROFILES = {
     'dev':  dict(n_particles=32, n_iters=30,  n_runs=3),
-    'full': dict(n_particles=32, n_iters=100, n_runs=30),
+    'full': dict(n_particles=32, n_iters=60, n_runs=20),
 }
 
 GEN_FIELDS = [

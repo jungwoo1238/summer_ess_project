@@ -976,6 +976,9 @@ SCHEDULE_FIELDS = [
     'load_mw', 'smp_won_per_kwh', 'p_slack_base', 'p_slack_ess', 'p_slack_ess_qzero',
     # 현재 lower_lp/evaluate가 시각별 값을 반환하지 않아 결측으로 저장되는 그룹 C 항목.
     'v_lindistflow', 'mu_penalty_active',
+    # gbest 진단 재평가의 기존 X0/X1/C0/C1에서 계산(추가 solve/runpp 없음).
+    'recompute_p_shift_mw', 'recompute_p_shift_frac_s',
+    'recompute_coef_delta_max', 'recompute_jnet_delta_won',
 ]
 
 # 다각형 바인딩 판정 여유(원 제약을 다각형이 근사하는 정도 - CLAUDE.md 부록C.4-(2), POLY_N=12
@@ -1111,12 +1114,22 @@ def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slac
                 loss_pcs_t = (1.0 - PM.ETA_PCS) * (s_apparent - abs(p_net_t))
                 v_lindistflow = ''
                 mu_penalty_active = ''
+                recompute_p_shift_mw = ''
+                recompute_p_shift_frac_s = ''
+                recompute_coef_delta_max = ''
+                recompute_jnet_delta_won = ''
                 if detail is not None and detail.get('v_lindistflow_sq') is not None:
                     v_sq_t = float(detail['v_lindistflow_sq'][s][int(b), t])
                     v_lindistflow = float(np.sqrt(max(v_sq_t, 0.0)))
                     mu_penalty_active = bool(
                         v_sq_t < PM.V_SQ_MIN or v_sq_t > PM.V_SQ_MAX
                     )
+                if detail is not None and detail.get('recompute_time_diag') is not None:
+                    time_diag = detail['recompute_time_diag'][s]
+                    recompute_p_shift_mw = float(time_diag['p_shift_mw'][t])
+                    recompute_p_shift_frac_s = float(time_diag['p_shift_frac_s'][t])
+                    recompute_coef_delta_max = float(time_diag['coef_delta_max'][t])
+                    recompute_jnet_delta_won = float(time_diag['jnet_delta_won'][t])
 
                 rows.append(dict(
                     scenario=s, t=t, unit=i, b=b,
@@ -1129,6 +1142,10 @@ def build_schedule_rows(installed_units, schedules, base_p_sum, slack_base, slac
                     p_slack_ess_qzero=p_slack_ess_qzero_t,
                     v_lindistflow=v_lindistflow,
                     mu_penalty_active=mu_penalty_active,
+                    recompute_p_shift_mw=recompute_p_shift_mw,
+                    recompute_p_shift_frac_s=recompute_p_shift_frac_s,
+                    recompute_coef_delta_max=recompute_coef_delta_max,
+                    recompute_jnet_delta_won=recompute_jnet_delta_won,
                 ))
     return rows
 

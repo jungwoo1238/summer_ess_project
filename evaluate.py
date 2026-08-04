@@ -188,6 +188,7 @@ def _ensure_sgens(net, n):
 # 더 단순해졌다.
 
 _LOSS_COEFF_NAMES = ("a_P", "a_Q", "b_PP", "b_QQ", "b_PQ")
+_COEF_REL_EPS = 1e-12
 S_ACTIVE_MIN = 1e-6  # MVA (1 kVA); 이보다 작으면 조류·편익 관점에서 비활성
 E_ACTIVE_MIN = 1e-6  # MWh (1 Wh); S 또는 E 하나라도 미만이면 비활성
 
@@ -264,6 +265,61 @@ def _solution_dict(kind, solved, *, has_voltage=False):
     return result
 
 
+def _loss_cost_model_by_time(coeffs, P_net, Q):
+    """Return the five-coefficient L_cost contribution in MW for each hour."""
+    P_net = np.asarray(P_net, dtype=float).reshape(1, PM.TIME_STEPS)
+    Q = np.asarray(Q, dtype=float).reshape(1, PM.TIME_STEPS)
+    return (
+        np.asarray(coeffs["a_P"], dtype=float) * P_net
+        + np.asarray(coeffs["a_Q"], dtype=float) * Q
+        + np.asarray(coeffs["b_PP"], dtype=float) * P_net**2
+        + np.asarray(coeffs["b_QQ"], dtype=float) * Q**2
+        + np.asarray(coeffs["b_PQ"], dtype=float) * P_net * Q
+    )[0]
+
+
+def _recompute_time_diagnostics(S, scenario, X0, X1, C0, C1):
+    """Build trigger-design diagnostics from already available X0/X1/C0/C1.
+
+    No solve or power flow is performed here.  ``jnet_delta_won`` is the
+    scenario-day loss-cost proxy ``cost(C0,X0)-cost(C1,X1)``; positive means
+    the recomputed path improves the monetary loss contribution.  PEAK rows
+    use their scenario SMP in the same one-day proxy and are not annualized.
+    """
+    p0 = np.asarray(X0["P_net"], dtype=float).reshape(1, PM.TIME_STEPS)[0]
+    # The first shared coefficient surface is measured at p_center=0 for all t.
+    p_shift_mw = np.abs(p0)
+    p_shift_frac_s = (
+        p_shift_mw / float(S)
+        if float(S) > 0.0
+        else np.full(PM.TIME_STEPS, np.nan, dtype=float)
+    )
+
+    relative_changes = []
+    for name in _LOSS_COEFF_NAMES:
+        c0 = np.asarray(C0[name], dtype=float).reshape(1, PM.TIME_STEPS)[0]
+        c1 = np.asarray(C1[name], dtype=float).reshape(1, PM.TIME_STEPS)[0]
+        relative_changes.append(np.abs(c1 - c0) / np.maximum(np.abs(c0), _COEF_REL_EPS))
+    coef_delta_max = np.max(np.asarray(relative_changes, dtype=float), axis=0)
+
+    loss_cost_before_mw = _loss_cost_model_by_time(
+        C0, X0["P_net"], X0["Q"]
+    )
+    loss_cost_after_mw = _loss_cost_model_by_time(
+        C1, X1["P_net"], X1["Q"]
+    )
+    smp_won_per_mwh = np.asarray(PM.SMP_PER_MWH[scenario], dtype=float)
+    jnet_delta_won = (
+        loss_cost_before_mw - loss_cost_after_mw
+    ) * smp_won_per_mwh * PM.DT_HOURS
+    return {
+        "p_shift_mw": p_shift_mw,
+        "p_shift_frac_s": p_shift_frac_s,
+        "coef_delta_max": coef_delta_max,
+        "jnet_delta_won": jnet_delta_won,
+    }
+
+
 def _solve_with_recompute(
     kind,
     bus,
@@ -281,10 +337,11 @@ def _solve_with_recompute(
 ):
     """n=1의 측정1→solve1→운영점 측정2→solve2 파이프라인.
 
-    기본 반환은 최종 X1의 기존 lower_lp 튜플이다. ``return_intermediates=True``이면
-    X0/X1과 C0/C1을 담은 dict를 반환한다. ``net``은 2차 측정 전용 net이며 시각 간
-    재사용한다. ``_c0_grid``는 _solve_unit_schedules가 ALL_DAYS 1차 측정을 공유하기 위한
-    내부 인자다.
+    기본 반환은 RECOMPUTE_ENABLED=False에서 X0, True에서 종전 X1의 lower_lp
+    튜플이다. ``return_intermediates=True``이면 스위치와 무관하게 X0/X1/X2와
+    C0/C1/C2를 담은 dict를 반환한다. ``net``은 진단/복원 경로의 2차 측정 전용이며
+    시각 간 재사용한다. ``_c0_grid``는 _solve_unit_schedules가 ALL_DAYS 1차 측정을
+    공유하기 위한 내부 인자다.
     """
     if kind not in {"avg", "peak"}:
         raise ValueError(f"kind must be 'avg' or 'peak', got {kind!r}")
@@ -321,12 +378,20 @@ def _solve_with_recompute(
     else:
         if load_total is None:
             raise ValueError("load_total is required for kind='peak'")
+        if smp is None:
+            raise ValueError("smp is required for kind='peak'")
         load_total = np.asarray(load_total, dtype=float)
+        smp = np.asarray(smp, dtype=float)
         solved0 = solve_peak(
-            S, E, bus, load_total, profile, C0,
+            S, E, bus, load_total, smp, profile, C0,
             force_q_zero=force_q_zero, assert_physics=False,
             return_voltage=return_intermediates,
         )
+
+    # 최적화 기본 경로는 C0로 얻은 X0를 최종 해로 쓴다. 진단 경로는
+    # RECOMPUTE_ENABLED와 무관하게 C1/X1/C2/X2를 계속 계산한다.
+    if not return_intermediates and not PM.RECOMPUTE_ENABLED:
+        return solved0
 
     X0 = _solution_dict(kind, solved0, has_voltage=return_intermediates)
     measurement_net = build_net() if net is None else net
@@ -342,7 +407,7 @@ def _solve_with_recompute(
         )
     else:
         solved1 = solve_peak(
-            S, E, bus, load_total, profile, C1,
+            S, E, bus, load_total, smp, profile, C1,
             force_q_zero=force_q_zero, assert_physics=False,
             return_voltage=return_intermediates,
         )
@@ -350,8 +415,12 @@ def _solve_with_recompute(
     if not return_intermediates:
         return solved1
     X1 = _solution_dict(kind, solved1, has_voltage=True)
+    recompute_time_diag = _recompute_time_diagnostics(
+        S, scenario, X0, X1, C0, C1
+    )
 
-    # X2는 진단 경로에서만 계산한다. 최적화에 사용하는 최종 해는 기존과 동일한 X1이다.
+    # X2는 진단 경로에서만 계산한다. 최종 편익 해는 _solve_unit_schedules가
+    # RECOMPUTE_ENABLED에 따라 X0/X1 중 선택한다.
     C2 = _measure_recomputed_coeffs_1unit(
         bus, S, scenario, X1["P_net"], net=measurement_net
     )
@@ -363,7 +432,7 @@ def _solve_with_recompute(
         )
     else:
         solved2 = solve_peak(
-            S, E, bus, load_total, profile, C2,
+            S, E, bus, load_total, smp, profile, C2,
             force_q_zero=force_q_zero, assert_physics=False,
             return_voltage=True,
         )
@@ -376,13 +445,19 @@ def _solve_with_recompute(
         "C0": C0,
         "C1": C1,
         "C2": C2,
+        "recompute_time_diag": recompute_time_diag,
     }
 
 
 def _solve_unit_schedules(
-    b, S, E, base_p_sum, *, return_soc=False, return_detail=False
+    b, S, E, base_p_sum, *, return_soc=False, return_detail=False,
+    force_q_zero=False,
 ):
-    """ALL_DAYS n=1 스케줄을 계수 1회 재산출 후 최종 X1으로 구성한다.
+    """ALL_DAYS n=1 스케줄을 구성한다.
+
+    최적화 기본값(RECOMPUTE_ENABLED=False)은 공유 C0의 X0를 최종 해로 쓴다.
+    return_detail 진단은 X1/X2까지 계산하되 최종 편익 스케줄은 같은 스위치에
+    따라 X0 또는 X1을 선택해 최적화 경로와 일치시킨다.
 
     향후 다수기에서는 각 기별 active mask를 적용할 수 있게 임계값 판정을 배열로 만든다.
     현재 명령 범위는 n=1이며 비활성 기는 측정·QP를 전부 건너뛴다.
@@ -426,11 +501,14 @@ def _solve_unit_schedules(
         p_center=0.0,
         strict=True,
     )
-    recompute_net = build_net()
+    recompute_net = (
+        build_net() if (return_detail or PM.RECOMPUTE_ENABLED) else None
+    )
     unit_p = {}
     unit_q = {}
     unit_soc = {}
     intermediates = {}
+    final_solution_key = "X1" if PM.RECOMPUTE_ENABLED else "X0"
 
     for scenario in PM.AVG_DAYS:
         profile = np.asarray(PM.LOAD[scenario], dtype=float)
@@ -445,13 +523,14 @@ def _solve_unit_schedules(
             net=recompute_net,
             _c0_grid=c0_grid,
             return_intermediates=return_detail,
+            force_q_zero=force_q_zero,
         )
         if return_detail:
             intermediates[scenario] = solved
             P_net, Q, soc = (
-                solved["X1"]["P_net"],
-                solved["X1"]["Q"],
-                solved["X1"]["soc"],
+                solved[final_solution_key]["P_net"],
+                solved[final_solution_key]["Q"],
+                solved[final_solution_key]["soc"],
             )
         else:
             P_net, Q, soc = solved
@@ -468,18 +547,20 @@ def _solve_unit_schedules(
             e_mwh,
             scenario,
             load_total=float(base_p_sum) * profile,
+            smp=np.asarray(PM.SMP_PER_MWH[scenario], dtype=float),
             profile=profile,
             net=recompute_net,
             _c0_grid=c0_grid,
             return_intermediates=return_detail,
+            force_q_zero=force_q_zero,
         )
         if return_detail:
             intermediates[scenario] = solved
             P_net, Q, soc, _pk = (
-                solved["X1"]["P_net"],
-                solved["X1"]["Q"],
-                solved["X1"]["soc"],
-                solved["X1"]["pk"],
+                solved[final_solution_key]["P_net"],
+                solved[final_solution_key]["Q"],
+                solved[final_solution_key]["soc"],
+                solved[final_solution_key]["pk"],
             )
         else:
             P_net, Q, soc, _pk = solved
@@ -632,7 +713,9 @@ def _accounting_values(base_flow, p_slack_ess, S, E):
     )
 
 
-def evaluate_particle(x, return_detail=False, collect_diagnostics=False):
+def evaluate_particle(
+    x, return_detail=False, collect_diagnostics=False, force_q_zero=False
+):
     """입자 x(3n차원, C.6-3 이후) 평가. 기본 반환: fitness(float, PSO 최소화용).
     return_detail=True면 편익 분해·위반량·발산정보·스케줄을 담은 dict를 반환한다(8절 후처리,
     디버깅용). collect_diagnostics=True를 함께 주면 X0/X1/X2·전압·추가 AC 진단을 수행한다.
@@ -653,15 +736,20 @@ def evaluate_particle(x, return_detail=False, collect_diagnostics=False):
     if collect_diagnostics:
         try:
             unit_p, unit_q, intermediates = _solve_unit_schedules(
-                b, S, E, base_p.sum(), return_detail=True
+                b, S, E, base_p.sum(), return_detail=True,
+                force_q_zero=force_q_zero,
             )
         except Exception as exc:
             # 계측(X2/전압) 실패는 최적해 평가를 죽이지 않는다. 기존 X1 경로로 재시도한다.
             diagnostic_error = f'{type(exc).__name__}: {exc}'
-            unit_p, unit_q = _solve_unit_schedules(b, S, E, base_p.sum())
+            unit_p, unit_q = _solve_unit_schedules(
+                b, S, E, base_p.sum(), force_q_zero=force_q_zero
+            )
             intermediates = None
     else:
-        unit_p, unit_q = _solve_unit_schedules(b, S, E, base_p.sum())
+        unit_p, unit_q = _solve_unit_schedules(
+            b, S, E, base_p.sum(), force_q_zero=force_q_zero
+        )
         intermediates = None
     ac_result = _run_schedule_ac(
         unit_p, unit_q, b, S, E, collect_voltage=collect_diagnostics
@@ -747,15 +835,33 @@ def evaluate_particle(x, return_detail=False, collect_diagnostics=False):
     recompute_jnet_delta = float('nan')
     recompute_convergence_ratio = float('nan')
     recompute_max_p_shift = float('nan')
+    recompute_time_diag = None
     v_lindistflow_sq = None
     if intermediates:
         try:
+            recompute_time_diag = {
+                s: {
+                    name: np.asarray(values, dtype=float)
+                    for name, values in intermediates[s][
+                        'recompute_time_diag'
+                    ].items()
+                }
+                for s in PM.ALL_DAYS
+            }
             unit_p_x0 = {
                 s: np.asarray(intermediates[s]['X0']['P_net'])
                 for s in PM.ALL_DAYS
             }
             unit_q_x0 = {
                 s: np.asarray(intermediates[s]['X0']['Q'])
+                for s in PM.ALL_DAYS
+            }
+            unit_p_x1 = {
+                s: np.asarray(intermediates[s]['X1']['P_net'])
+                for s in PM.ALL_DAYS
+            }
+            unit_q_x1 = {
+                s: np.asarray(intermediates[s]['X1']['Q'])
                 for s in PM.ALL_DAYS
             }
             unit_p_x2 = {
@@ -766,9 +872,10 @@ def evaluate_particle(x, return_detail=False, collect_diagnostics=False):
                 s: np.asarray(intermediates[s]['X2']['Q'])
                 for s in PM.ALL_DAYS
             }
+            final_solution_key = 'X1' if PM.RECOMPUTE_ENABLED else 'X0'
             v_lindistflow_sq = {
                 s: np.asarray(
-                    intermediates[s]['X1']['v_lindistflow_sq'],
+                    intermediates[s][final_solution_key]['v_lindistflow_sq'],
                     dtype=float,
                 )
                 for s in PM.ALL_DAYS
@@ -785,22 +892,32 @@ def evaluate_particle(x, return_detail=False, collect_diagnostics=False):
                 for s in PM.ALL_DAYS
             )
 
-            ac_x0 = _run_schedule_ac(unit_p_x0, unit_q_x0, b, S, E)
+            # ac_result는 스위치에 따른 실제 최종 경로의 AC 결과다. 이를 X0 또는
+            # X1에 재사용해 진단 AC 호출 수를 종전과 같은 총 3회로 유지한다.
+            if PM.RECOMPUTE_ENABLED:
+                ac_x1 = ac_result
+                ac_x0 = _run_schedule_ac(unit_p_x0, unit_q_x0, b, S, E)
+            else:
+                ac_x0 = ac_result
+                ac_x1 = _run_schedule_ac(unit_p_x1, unit_q_x1, b, S, E)
             ac_x2 = _run_schedule_ac(unit_p_x2, unit_q_x2, b, S, E)
-            if ac_x0['diverged'] or ac_x2['diverged']:
+            if ac_x0['diverged'] or ac_x1['diverged'] or ac_x2['diverged']:
                 diagnostic_error = (
                     diagnostic_error
-                    or 'X0/X2 diagnostic AC power flow diverged'
+                    or 'X0/X1/X2 diagnostic AC power flow diverged'
                 )
             else:
                 j0 = _accounting_values(
                     base_flow, ac_x0['p_slack_ess'], S, E
                 )['j_net']
+                j1 = _accounting_values(
+                    base_flow, ac_x1['p_slack_ess'], S, E
+                )['j_net']
                 j2 = _accounting_values(
                     base_flow, ac_x2['p_slack_ess'], S, E
                 )['j_net']
-                delta_10 = float(j_net_val - j0)
-                delta_21 = float(j2 - j_net_val)
+                delta_10 = float(j1 - j0)
+                delta_21 = float(j2 - j1)
                 recompute_jnet_delta = delta_10
                 if abs(delta_10) > 0.0:
                     recompute_convergence_ratio = abs(delta_21) / abs(delta_10)
@@ -840,6 +957,7 @@ def evaluate_particle(x, return_detail=False, collect_diagnostics=False):
         recompute_jnet_delta=recompute_jnet_delta,
         recompute_convergence_ratio=recompute_convergence_ratio,
         recompute_max_p_shift=recompute_max_p_shift,
+        recompute_time_diag=recompute_time_diag,
         diagnostic_error=diagnostic_error,
         b=b, S=S, E=E,
     )
