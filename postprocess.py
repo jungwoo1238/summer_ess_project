@@ -39,7 +39,7 @@ import json
 import math
 import argparse
 import datetime
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 
@@ -61,6 +61,15 @@ DECOMP_ATOL_NEAR_ZERO = 10.0      # 원칙4: 금액·기대값=0 -> atol=10.0 (t
 BOUNDARY_WARN_FRAC = 0.02         # 정규화 위치가 이 미만/((1-이 값) 초과)면 경계 근접 경고
 SOC_CYCLE_ATOL_MWH = 1e-4         # SOC[24]==SOC[0] 검증 허용오차 (lower_lp._assert_physics의 tol과 동일)
 Q_NONZERO_TOL_MVAR = 1e-9
+
+# IEEE 33-bus case33bw의 활성 방사형 위상(0-based). 분기 기점 버스는 주간선에
+# 남기고, 각 lateral의 첫 버스부터 해당 분기로 분류한다.
+FEEDER_BRANCH_BY_BUS = {
+    **{bus: 'main' for bus in range(0, 18)},
+    **{bus: 'branch_A_bus1' for bus in range(18, 22)},
+    **{bus: 'branch_B_bus2' for bus in range(22, 25)},
+    **{bus: 'branch_C_bus5' for bus in range(25, 33)},
+}
 
 
 def section(title):
@@ -93,6 +102,11 @@ NUMERIC_RUN_FIELDS = [
     'recompute_max_p_shift', 'coef_cache_hit_rate', 'coef_runpp_total',
     'coef_unique_bs_count', 'coef_measure_wall_s',
 ]
+OPTIONAL_NUMERIC_RUN_FIELDS = [
+    'cross_effect_pct_avg_max', 'cross_effect_pct_peak_max',
+    'cross_effect_mw_avg_total', 'cross_effect_mw_peak_total',
+    'cross_effect_won_avg_annual',
+]
 
 
 def _to_float(s):
@@ -121,6 +135,10 @@ def load_runs_csv(path):
                 rec[k] = None
             else:
                 rec[k] = _to_float(row[k])
+        # 다기 진단은 신규 optional 스키마다. 구 CSV에서 없어도 기존 결측 보고와
+        # n=1 출력이 바뀌지 않도록 missing_cols에는 넣지 않는다.
+        for k in OPTIONAL_NUMERIC_RUN_FIELDS:
+            rec[k] = _to_float(row.get(k, ''))
         rec['n_ess'] = int(float(row['n_ess']))
         rec['run'] = int(float(row['run']))
         rec['seed'] = row.get('seed', '')
@@ -693,6 +711,106 @@ def section3_6_q_ratio(group):
     print('  현 뼈대는 PSO가 q 차원을 탐색하지 않는다(q=0 고정, CLAUDE.md 7-A절) - 값은 항상 0.',
           flush=True)
     print('  q_ratio 스윕(8절-6)은 별도 스크립트 사안이며 이 모듈에서는 계산하지 않는다.', flush=True)
+
+
+def _active_units_for_qp(units):
+    """evaluate._solve_unit_schedules와 동일한 active mask를 적용한다."""
+    return [
+        (b, S, E) for b, S, E in units
+        if S >= evaluate.S_ACTIVE_MIN and E >= evaluate.E_ACTIVE_MIN
+    ]
+
+
+def section3_7_cross_effect(group):
+    """n>=2의 QP 대각근사 오차와 편익환산 상한을 출력한다."""
+    section(f"(3)-7 다기 대각근사 오차 - n_ess={group['n_ess']}")
+    runs = group['runs']
+    avg_pct = _stats([r['cross_effect_pct_avg_max'] for r in runs])
+    peak_pct = _stats([r['cross_effect_pct_peak_max'] for r in runs])
+    avg_mwh = _stats([r['cross_effect_mw_avg_total'] for r in runs])
+    peak_mwh = _stats([r['cross_effect_mw_peak_total'] for r in runs])
+    annual_won = _stats([r['cross_effect_won_avg_annual'] for r in runs])
+    if avg_pct['n'] == 0 and peak_pct['n'] == 0:
+        print('  qp_diag_loss_vs_ac 신규 컬럼이 없어 생략(구 runs.csv 스키마).', flush=True)
+        return None
+
+    _print_stats('AVG max |error|', avg_pct, '%')
+    _print_stats('PEAK max |error|', peak_pct, '%')
+    # main.py 컬럼명에는 호환상 mw가 남지만 실제 값은 시간 적분된 MWh다.
+    _print_stats('AVG cross total', avg_mwh, ' MWh')
+    _print_stats('PEAK cross total', peak_mwh, ' MWh')
+    _print_stats('AVG annual impact', annual_won, ' 원/년')
+    print('  참조선: n=1에서는 교차항이 0이므로 이 값은 단일기 손실모형 오차만 담는다. '
+          'n>=2에서 n=1 대비 증가한 크기가 기 간 교차항이 QP 스케줄 선택에 준 영향의 '
+          '참조값이다(수치만 제시, 자동 판정 없음).', flush=True)
+    print('  AVG annual impact는 시각별 (AC-QP) 손실MW × SMP(원/MWh) × DT × '
+          'N_WEEKDAYS의 정확 합이며, 교차항+근사오차가 연간 편익에 줄 수 있는 영향 상한이다.',
+          flush=True)
+    return dict(
+        avg_pct=avg_pct, peak_pct=peak_pct, avg_mwh=avg_mwh,
+        peak_mwh=peak_mwh, annual_won=annual_won,
+    )
+
+
+def section3_8_branch_distribution(group):
+    """활성 기가 같은 lateral/주간선에 모이는지 run 분포를 출력한다."""
+    section(f"(3)-8 다기 분기 배치 분포 - n_ess={group['n_ess']}")
+    same_count = 0
+    different_count = 0
+    insufficient_count = 0
+    combinations = Counter()
+    for run in group['runs']:
+        units = parse_units(run['x'], group['n_ess'])
+        active = _active_units_for_qp(units)
+        branches = tuple(sorted(FEEDER_BRANCH_BY_BUS[b] for b, _, _ in active))
+        if len(branches) < 2:
+            insufficient_count += 1
+            continue
+        combinations[branches] += 1
+        if len(set(branches)) == 1:
+            same_count += 1
+        else:
+            different_count += 1
+
+    eligible = same_count + different_count
+    if eligible:
+        same_pct = same_count / eligible * 100.0
+        different_pct = different_count / eligible * 100.0
+        mode_combo, mode_count = combinations.most_common(1)[0]
+        print(f'  활성 기 2개 이상 run={eligible}: 같은 분기={same_count} '
+              f'({same_pct:.6g}%), 다른 분기={different_count} '
+              f'({different_pct:.6g}%)', flush=True)
+        print(f'  최빈 분기 조합={mode_combo}, {mode_count}회', flush=True)
+        for combo, count in combinations.most_common():
+            print(f'    {combo}: {count}', flush=True)
+    else:
+        print('  활성 기가 2개 이상인 run이 없어 같은/다른 분기 비율을 정의할 수 없음.', flush=True)
+    print(f'  활성 기 0~1개로 분기 비교에서 제외된 run={insufficient_count}', flush=True)
+    return dict(
+        same=same_count, different=different_count,
+        insufficient=insufficient_count, combinations=dict(combinations),
+    )
+
+
+def section3_9_active_mask(group):
+    """evaluate와 같은 임계값으로 실질 활성 기수 분포를 출력한다."""
+    section(f"(3)-9 다기 active mask 현황 - n_ess={group['n_ess']}")
+    counts = Counter()
+    for run in group['runs']:
+        units = parse_units(run['x'], group['n_ess'])
+        counts[len(_active_units_for_qp(units))] += 1
+    total = sum(counts.values())
+    distribution = ', '.join(
+        f'{n_active}:{count}' for n_active, count in sorted(counts.items())
+    )
+    collapsed = sum(
+        count for n_active, count in counts.items() if n_active < group['n_ess']
+    )
+    print(f'  active 기준: S>={evaluate.S_ACTIVE_MIN:.6g} MVA and '
+          f'E>={evaluate.E_ACTIVE_MIN:.6g} MWh', flush=True)
+    print(f'  실질 기수 분포(active기수:run수) = {distribution}', flush=True)
+    print(f'  명목 n_ess보다 활성 기가 적은 run={collapsed}/{total}', flush=True)
+    return dict(distribution=dict(counts), collapsed=collapsed, total=total)
 
 
 # ============================================================
@@ -1493,6 +1611,13 @@ def process_group(runs_path, out_dir, ts):
 
     bus_dist = section3_5_bus_distribution(group, decomp)
     section3_6_q_ratio(group)
+    multi_diag = None
+    if group['n_ess'] >= 2:
+        multi_diag = dict(
+            cross_effect=section3_7_cross_effect(group),
+            branch_distribution=section3_8_branch_distribution(group),
+            active_mask=section3_9_active_mask(group),
+        )
     convergence = section4_convergence(group, decomp)
     search_failure = section5_search_failure(group, decomp)
     neg_bdefer = section6_negative_bdefer(group)
@@ -1511,6 +1636,7 @@ def process_group(runs_path, out_dir, ts):
         operating=operating, efc=efc_result, bus_dist=bus_dist, convergence=convergence,
         search_failure=search_failure, neg_bdefer=neg_bdefer, boundary=boundary,
         similarity=similarity_result, schedule9=schedule9_result,
+        multi_unit_diagnostics=multi_diag,
     )
 
 
@@ -1526,11 +1652,9 @@ def print_cross_n_curve(all_results):
         return
 
     if any(r['n_ess'] >= 2 for r in valid):
-        print('  ★ 주의(CLAUDE.md 2절/7-A절): n>=2 결과는 각 기의 solve_peak이 전체 시스템 부하를 '
-              '독립적으로 보고 계산되어 b_defer가 구조적으로 과소평가된 상태다(실측: 2등분 시 '
-              '단일 대비 0.53배, probe_split.py 참조). 아래 곡선의 n>=2 지점은 이 한계를 감안해서 '
-              '읽을 것 - "최적 기수 1" 결론의 근거로 이 곡선을 쓰지 말 것(그 결론은 6-A절 한계 '
-              'j_net 부호전환에서 독립적으로 성립한다).', flush=True)
+        print('  ★ n>=2는 통합 solve_avg/solve_peak로 계산된다. QP 손실항만 기별 대각근사이며, '
+              '최종 편익은 전 기 동시 AC 조류계산 결과다. 대각근사 영향은 (3)-7의 '
+              'qp_diag_loss_vs_ac 진단과 함께 읽을 것.', flush=True)
 
     print(f"\n  {'n_ess':>6s} | {'run수':>5s} | {'탐색실패':>8s} | {'j_net median(전체)':>20s} | "
           f"{'j_net median(정상만)':>20s}", flush=True)

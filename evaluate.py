@@ -208,6 +208,22 @@ def _assemble_coeffs_1unit(grid_result, scenario):
     }
 
 
+def _assemble_coeffs_nunit(grid_results, scenario):
+    """기별 측정 grid를 lower_lp용 (n,T) 대각 계수 배열로 조립한다."""
+    if not grid_results:
+        raise ValueError("at least one coefficient grid is required")
+    per_unit = [
+        _assemble_coeffs_1unit(grid_result, scenario)
+        for grid_result in grid_results
+    ]
+    return {
+        name: np.concatenate(
+            [coeffs[name] for coeffs in per_unit], axis=0
+        )
+        for name in _LOSS_COEFF_NAMES
+    }
+
+
 def _measure_recomputed_coeffs_1unit(
     bus, S, scenario, p_center, *, net
 ):
@@ -244,6 +260,33 @@ def _measure_recomputed_coeffs_1unit(
     return assembled
 
 
+def _measure_recomputed_coeffs_nunit(
+    bus, S, scenario, p_center, *, net
+):
+    """기별 운영점 재측정 계수를 axis=0으로 쌓아 (n,T)로 반환한다."""
+    bus = np.atleast_1d(np.asarray(bus, dtype=int))
+    S = np.atleast_1d(np.asarray(S, dtype=float))
+    p_center = np.asarray(p_center, dtype=float)
+    n = len(bus)
+    if S.shape != (n,) or p_center.shape != (n, PM.TIME_STEPS):
+        raise ValueError(
+            "recompute input shape mismatch: "
+            f"bus={bus.shape}, S={S.shape}, p_center={p_center.shape}"
+        )
+    per_unit = [
+        _measure_recomputed_coeffs_1unit(
+            int(bus[i]), float(S[i]), scenario, p_center[i], net=net
+        )
+        for i in range(n)
+    ]
+    return {
+        name: np.concatenate(
+            [coeffs[name] for coeffs in per_unit], axis=0
+        )
+        for name in _LOSS_COEFF_NAMES
+    }
+
+
 def _solution_dict(kind, solved, *, has_voltage=False):
     """lower_lp 반환 튜플을 진단용 이름 기반 dict로 바꾼다."""
     if kind == "avg":
@@ -266,16 +309,25 @@ def _solution_dict(kind, solved, *, has_voltage=False):
 
 
 def _loss_cost_model_by_time(coeffs, P_net, Q):
-    """Return the five-coefficient L_cost contribution in MW for each hour."""
-    P_net = np.asarray(P_net, dtype=float).reshape(1, PM.TIME_STEPS)
-    Q = np.asarray(Q, dtype=float).reshape(1, PM.TIME_STEPS)
-    return (
+    """Return summed diagonal five-coefficient L_cost in MW by hour."""
+    P_net = np.atleast_2d(np.asarray(P_net, dtype=float))
+    Q = np.atleast_2d(np.asarray(Q, dtype=float))
+    if P_net.shape != Q.shape or P_net.shape[1:] != (PM.TIME_STEPS,):
+        raise ValueError(
+            f"P_net/Q shape mismatch: {P_net.shape}, {Q.shape}"
+        )
+    per_unit = (
         np.asarray(coeffs["a_P"], dtype=float) * P_net
         + np.asarray(coeffs["a_Q"], dtype=float) * Q
         + np.asarray(coeffs["b_PP"], dtype=float) * P_net**2
         + np.asarray(coeffs["b_QQ"], dtype=float) * Q**2
         + np.asarray(coeffs["b_PQ"], dtype=float) * P_net * Q
-    )[0]
+    )
+    if per_unit.shape != P_net.shape:
+        raise ValueError(
+            f"coefficient shape {per_unit.shape} != schedule shape {P_net.shape}"
+        )
+    return np.sum(per_unit, axis=0)
 
 
 def _recompute_time_diagnostics(S, scenario, X0, X1, C0, C1):
@@ -286,21 +338,30 @@ def _recompute_time_diagnostics(S, scenario, X0, X1, C0, C1):
     the recomputed path improves the monetary loss contribution.  PEAK rows
     use their scenario SMP in the same one-day proxy and are not annualized.
     """
-    p0 = np.asarray(X0["P_net"], dtype=float).reshape(1, PM.TIME_STEPS)[0]
+    p0 = np.atleast_2d(np.asarray(X0["P_net"], dtype=float))
+    S = np.atleast_1d(np.asarray(S, dtype=float))
+    if p0.shape != (len(S), PM.TIME_STEPS):
+        raise ValueError(
+            f"X0 P_net shape={p0.shape}, expected ({len(S)},{PM.TIME_STEPS})"
+        )
     # The first shared coefficient surface is measured at p_center=0 for all t.
-    p_shift_mw = np.abs(p0)
-    p_shift_frac_s = (
-        p_shift_mw / float(S)
-        if float(S) > 0.0
-        else np.full(PM.TIME_STEPS, np.nan, dtype=float)
+    p_shift_mw = np.sum(np.abs(p0), axis=0)
+    p_shift_frac_by_unit = np.divide(
+        np.abs(p0),
+        S[:, None],
+        out=np.full_like(p0, np.nan, dtype=float),
+        where=S[:, None] > 0.0,
     )
+    p_shift_frac_s = np.nanmax(p_shift_frac_by_unit, axis=0)
 
     relative_changes = []
     for name in _LOSS_COEFF_NAMES:
-        c0 = np.asarray(C0[name], dtype=float).reshape(1, PM.TIME_STEPS)[0]
-        c1 = np.asarray(C1[name], dtype=float).reshape(1, PM.TIME_STEPS)[0]
+        c0 = np.asarray(C0[name], dtype=float)
+        c1 = np.asarray(C1[name], dtype=float)
         relative_changes.append(np.abs(c1 - c0) / np.maximum(np.abs(c0), _COEF_REL_EPS))
-    coef_delta_max = np.max(np.asarray(relative_changes, dtype=float), axis=0)
+    coef_delta_max = np.max(
+        np.asarray(relative_changes, dtype=float), axis=(0, 1)
+    )
 
     loss_cost_before_mw = _loss_cost_model_by_time(
         C0, X0["P_net"], X0["Q"]
@@ -333,21 +394,28 @@ def _solve_with_recompute(
     net=None,
     force_q_zero=False,
     return_intermediates=False,
+    return_coeffs=False,
     _c0_grid=None,
 ):
-    """n=1의 측정1→solve1→운영점 측정2→solve2 파이프라인.
+    """n기 측정1→조인트 solve1→기별 재측정2→조인트 solve2 파이프라인.
 
     기본 반환은 RECOMPUTE_ENABLED=False에서 X0, True에서 종전 X1의 lower_lp
     튜플이다. ``return_intermediates=True``이면 스위치와 무관하게 X0/X1/X2와
     C0/C1/C2를 담은 dict를 반환한다. ``net``은 진단/복원 경로의 2차 측정 전용이며
-    시각 간 재사용한다. ``_c0_grid``는 _solve_unit_schedules가 ALL_DAYS 1차 측정을
-    공유하기 위한 내부 인자다.
+    시각 간 재사용한다. ``_c0_grid``는 기별 grid list이며
+    _solve_unit_schedules가 ALL_DAYS 1차 측정을 공유하기 위한 내부 인자다.
+    ``return_coeffs=True``인 기본 반환은 ``(solved, final_coeffs)``다.
     """
     if kind not in {"avg", "peak"}:
         raise ValueError(f"kind must be 'avg' or 'peak', got {kind!r}")
-    bus = int(bus)
-    S = float(S)
-    E = float(E)
+    bus = np.atleast_1d(np.asarray(bus, dtype=int))
+    S = np.atleast_1d(np.asarray(S, dtype=float))
+    E = np.atleast_1d(np.asarray(E, dtype=float))
+    n = len(bus)
+    if S.shape != (n,) or E.shape != (n,):
+        raise ValueError(
+            f"bus/S/E shape mismatch: {bus.shape}, {S.shape}, {E.shape}"
+        )
     scenario = str(scenario)
     profile = np.asarray(profile, dtype=float)
     if profile.shape != (PM.TIME_STEPS,):
@@ -356,15 +424,25 @@ def _solve_with_recompute(
         )
 
     if _c0_grid is None:
-        _c0_grid = loss_coeffs.measure_coeffs_grid(
-            bus,
-            S,
-            scenarios=[scenario],
-            times=range(PM.TIME_STEPS),
-            p_center=0.0,
-            strict=True,
-        )
-    C0 = _assemble_coeffs_1unit(_c0_grid, scenario)
+        _c0_grid = [
+            loss_coeffs.measure_coeffs_grid(
+                int(bus[i]),
+                float(S[i]),
+                scenarios=[scenario],
+                times=range(PM.TIME_STEPS),
+                p_center=0.0,
+                strict=True,
+            )
+            for i in range(n)
+        ]
+    elif isinstance(_c0_grid, dict):
+        # n=1 기존 내부 호출과 외부 진단 호출의 호환성을 보존한다.
+        if n != 1:
+            raise ValueError("single c0 grid dict is valid only for n=1")
+        _c0_grid = [_c0_grid]
+    if len(_c0_grid) != n:
+        raise ValueError(f"c0 grid count={len(_c0_grid)}, expected n={n}")
+    C0 = _assemble_coeffs_nunit(_c0_grid, scenario)
 
     if kind == "avg":
         if smp is None:
@@ -391,11 +469,11 @@ def _solve_with_recompute(
     # 최적화 기본 경로는 C0로 얻은 X0를 최종 해로 쓴다. 진단 경로는
     # RECOMPUTE_ENABLED와 무관하게 C1/X1/C2/X2를 계속 계산한다.
     if not return_intermediates and not PM.RECOMPUTE_ENABLED:
-        return solved0
+        return (solved0, C0) if return_coeffs else solved0
 
     X0 = _solution_dict(kind, solved0, has_voltage=return_intermediates)
     measurement_net = build_net() if net is None else net
-    C1 = _measure_recomputed_coeffs_1unit(
+    C1 = _measure_recomputed_coeffs_nunit(
         bus, S, scenario, X0["P_net"], net=measurement_net
     )
 
@@ -413,7 +491,7 @@ def _solve_with_recompute(
         )
 
     if not return_intermediates:
-        return solved1
+        return (solved1, C1) if return_coeffs else solved1
     X1 = _solution_dict(kind, solved1, has_voltage=True)
     recompute_time_diag = _recompute_time_diagnostics(
         S, scenario, X0, X1, C0, C1
@@ -421,7 +499,7 @@ def _solve_with_recompute(
 
     # X2는 진단 경로에서만 계산한다. 최종 편익 해는 _solve_unit_schedules가
     # RECOMPUTE_ENABLED에 따라 X0/X1 중 선택한다.
-    C2 = _measure_recomputed_coeffs_1unit(
+    C2 = _measure_recomputed_coeffs_nunit(
         bus, S, scenario, X1["P_net"], net=measurement_net
     )
     if kind == "avg":
@@ -449,132 +527,186 @@ def _solve_with_recompute(
     }
 
 
+def _expand_active_rows(values, n, active_indices, *, fill=0.0):
+    values = np.asarray(values, dtype=float)
+    expanded = np.full((n,) + values.shape[1:], float(fill), dtype=float)
+    expanded[active_indices] = values
+    return expanded
+
+
+def _expand_active_coeffs(coeffs, n, active_indices):
+    return {
+        name: _expand_active_rows(coeffs[name], n, active_indices)
+        for name in _LOSS_COEFF_NAMES
+    }
+
+
+def _expand_active_solution(solution, n, active_indices, E):
+    expanded = dict(solution)
+    expanded["P_net"] = _expand_active_rows(
+        solution["P_net"], n, active_indices
+    )
+    expanded["Q"] = _expand_active_rows(solution["Q"], n, active_indices)
+    soc = np.repeat(
+        (PM.SOC_INIT_FRAC * np.asarray(E, dtype=float))[:, None],
+        PM.TIME_STEPS + 1,
+        axis=1,
+    )
+    soc[active_indices] = np.asarray(solution["soc"], dtype=float)
+    expanded["soc"] = soc
+    return expanded
+
+
+def _expand_active_intermediates(
+    diagnostic, n, active_indices, E
+):
+    expanded = dict(diagnostic)
+    for key in ("X0", "X1", "X2"):
+        expanded[key] = _expand_active_solution(
+            diagnostic[key], n, active_indices, E
+        )
+    for key in ("C0", "C1", "C2"):
+        expanded[key] = _expand_active_coeffs(
+            diagnostic[key], n, active_indices
+        )
+    expanded["active_indices"] = np.asarray(active_indices, dtype=int)
+    return expanded
+
+
 def _solve_unit_schedules(
     b, S, E, base_p_sum, *, return_soc=False, return_detail=False,
-    force_q_zero=False,
+    return_coeffs=False, force_q_zero=False,
 ):
-    """ALL_DAYS n=1 스케줄을 구성한다.
+    """ALL_DAYS n기 스케줄을 활성 기 조인트 QP로 구성한다.
 
-    최적화 기본값(RECOMPUTE_ENABLED=False)은 공유 C0의 X0를 최종 해로 쓴다.
-    return_detail 진단은 X1/X2까지 계산하되 최종 편익 스케줄은 같은 스위치에
-    따라 X0 또는 X1을 선택해 최적화 경로와 일치시킨다.
-
-    향후 다수기에서는 각 기별 active mask를 적용할 수 있게 임계값 판정을 배열로 만든다.
-    현재 명령 범위는 n=1이며 비활성 기는 측정·QP를 전부 건너뛴다.
+    각 활성 기의 손실계수는 독립 측정해 (n_active,T)로 쌓지만 QP는 시나리오당
+    한 번만 조인트 solve한다. 비활성 기는 측정·QP에서 제외하고 전체 n기 반환
+    배열의 P/Q를 0, SOC를 초기값으로 채운다.
     """
-    b = np.asarray(b)
-    S = np.asarray(S, dtype=float)
-    E = np.asarray(E, dtype=float)
-    if not (b.shape == S.shape == E.shape == (1,)):
-        raise NotImplementedError(
-            "QP coefficient recompute is currently defined for n=1 only"
+    b = np.atleast_1d(np.asarray(b, dtype=int))
+    S = np.atleast_1d(np.asarray(S, dtype=float))
+    E = np.atleast_1d(np.asarray(E, dtype=float))
+    n = len(b)
+    if S.shape != (n,) or E.shape != (n,):
+        raise ValueError(
+            f"b/S/E shape mismatch: {b.shape}, {S.shape}, {E.shape}"
         )
-    bus, s_mva, e_mwh = int(b[0]), float(S[0]), float(E[0])
     active = (S >= S_ACTIVE_MIN) & (E >= E_ACTIVE_MIN)
-    if not bool(active[0]):
-        unit_p = {
-            scenario: np.zeros((1, PM.TIME_STEPS), dtype=float)
-            for scenario in PM.ALL_DAYS
-        }
-        unit_q = {
-            scenario: np.zeros((1, PM.TIME_STEPS), dtype=float)
-            for scenario in PM.ALL_DAYS
-        }
-        if not return_soc:
-            if return_detail:
-                return unit_p, unit_q, {}
-            return unit_p, unit_q
-        unit_soc = {
-            scenario: np.zeros((1, PM.TIME_STEPS + 1), dtype=float)
-            for scenario in PM.ALL_DAYS
-        }
-        if return_detail:
-            return unit_p, unit_q, unit_soc, {}
-        return unit_p, unit_q, unit_soc
+    active_indices = np.flatnonzero(active)
+    b_active = b[active]
+    S_active = S[active]
+    E_active = E[active]
 
-    # 가장 비싼 p_center=0 측정은 AVG/PEAK 전 시나리오가 공유한다.
-    c0_grid = loss_coeffs.measure_coeffs_grid(
-        bus,
-        s_mva,
-        scenarios=PM.ALL_DAYS,
-        times=range(PM.TIME_STEPS),
-        p_center=0.0,
-        strict=True,
+    unit_p = {
+        scenario: np.zeros((n, PM.TIME_STEPS), dtype=float)
+        for scenario in PM.ALL_DAYS
+    }
+    unit_q = {
+        scenario: np.zeros((n, PM.TIME_STEPS), dtype=float)
+        for scenario in PM.ALL_DAYS
+    }
+    soc_initial = np.repeat(
+        (PM.SOC_INIT_FRAC * E)[:, None], PM.TIME_STEPS + 1, axis=1
     )
-    recompute_net = (
-        build_net() if (return_detail or PM.RECOMPUTE_ENABLED) else None
-    )
-    unit_p = {}
-    unit_q = {}
-    unit_soc = {}
+    unit_soc = {
+        scenario: soc_initial.copy() for scenario in PM.ALL_DAYS
+    }
+    qp_coeffs = {
+        scenario: {
+            name: np.zeros((n, PM.TIME_STEPS), dtype=float)
+            for name in _LOSS_COEFF_NAMES
+        }
+        for scenario in PM.ALL_DAYS
+    }
     intermediates = {}
-    final_solution_key = "X1" if PM.RECOMPUTE_ENABLED else "X0"
 
-    for scenario in PM.AVG_DAYS:
-        profile = np.asarray(PM.LOAD[scenario], dtype=float)
-        solved = _solve_with_recompute(
-            "avg",
-            bus,
-            s_mva,
-            e_mwh,
-            scenario,
-            smp=np.asarray(PM.SMP_PER_MWH[scenario], dtype=float),
-            profile=profile,
-            net=recompute_net,
-            _c0_grid=c0_grid,
-            return_intermediates=return_detail,
-            force_q_zero=force_q_zero,
+    if active_indices.size:
+        # p_center=0 측정은 전 시나리오가 공유한다. 정확히 같은 (bus,S)는
+        # 명시적으로 한 번만 호출하고, 그 밖의 재방문은 loss_coeffs 캐시가 처리한다.
+        shared_grids = {}
+        c0_grids = []
+        for bus_i, s_i in zip(b_active, S_active):
+            key = (int(bus_i), float(s_i))
+            if key not in shared_grids:
+                shared_grids[key] = loss_coeffs.measure_coeffs_grid(
+                    int(bus_i),
+                    float(s_i),
+                    scenarios=PM.ALL_DAYS,
+                    times=range(PM.TIME_STEPS),
+                    p_center=0.0,
+                    strict=True,
+                )
+            c0_grids.append(shared_grids[key])
+
+        recompute_net = (
+            build_net() if (return_detail or PM.RECOMPUTE_ENABLED) else None
         )
-        if return_detail:
-            intermediates[scenario] = solved
-            P_net, Q, soc = (
-                solved[final_solution_key]["P_net"],
-                solved[final_solution_key]["Q"],
-                solved[final_solution_key]["soc"],
-            )
-        else:
-            P_net, Q, soc = solved
-        unit_p[scenario] = P_net
-        unit_q[scenario] = Q
-        unit_soc[scenario] = soc
+        final_solution_key = "X1" if PM.RECOMPUTE_ENABLED else "X0"
+        final_coeff_key = "C1" if PM.RECOMPUTE_ENABLED else "C0"
 
-    for scenario in PM.PEAK_DAYS:
-        profile = np.asarray(PM.LOAD[scenario], dtype=float)
-        solved = _solve_with_recompute(
-            "peak",
-            bus,
-            s_mva,
-            e_mwh,
-            scenario,
-            load_total=float(base_p_sum) * profile,
-            smp=np.asarray(PM.SMP_PER_MWH[scenario], dtype=float),
-            profile=profile,
-            net=recompute_net,
-            _c0_grid=c0_grid,
-            return_intermediates=return_detail,
-            force_q_zero=force_q_zero,
-        )
-        if return_detail:
-            intermediates[scenario] = solved
-            P_net, Q, soc, _pk = (
-                solved[final_solution_key]["P_net"],
-                solved[final_solution_key]["Q"],
-                solved[final_solution_key]["soc"],
-                solved[final_solution_key]["pk"],
+        for scenario in PM.ALL_DAYS:
+            kind = "avg" if scenario in PM.AVG_DAYS else "peak"
+            profile = np.asarray(PM.LOAD[scenario], dtype=float)
+            kwargs = dict(
+                smp=np.asarray(PM.SMP_PER_MWH[scenario], dtype=float),
+                profile=profile,
+                net=recompute_net,
+                _c0_grid=c0_grids,
+                return_intermediates=return_detail,
+                return_coeffs=return_coeffs,
+                force_q_zero=force_q_zero,
             )
-        else:
-            P_net, Q, soc, _pk = solved
-        unit_p[scenario] = P_net
-        unit_q[scenario] = Q
-        unit_soc[scenario] = soc
+            if kind == "peak":
+                kwargs["load_total"] = float(base_p_sum) * profile
+            solved = _solve_with_recompute(
+                kind,
+                b_active,
+                S_active,
+                E_active,
+                scenario,
+                **kwargs,
+            )
 
+            if return_detail:
+                diagnostic = _expand_active_intermediates(
+                    solved, n, active_indices, E
+                )
+                intermediates[scenario] = diagnostic
+                final = diagnostic[final_solution_key]
+                coeffs_full = diagnostic[final_coeff_key]
+                P_net, Q, soc = (
+                    final["P_net"], final["Q"], final["soc"]
+                )
+            else:
+                if return_coeffs:
+                    solved_tuple, coeffs_active = solved
+                    coeffs_full = _expand_active_coeffs(
+                        coeffs_active, n, active_indices
+                    )
+                else:
+                    solved_tuple = solved
+                    coeffs_full = None
+                P_net, Q, soc = solved_tuple[:3]
+                P_net = _expand_active_rows(P_net, n, active_indices)
+                Q = _expand_active_rows(Q, n, active_indices)
+                soc_full = soc_initial.copy()
+                soc_full[active_indices] = np.asarray(soc, dtype=float)
+                soc = soc_full
+
+            unit_p[scenario] = P_net
+            unit_q[scenario] = Q
+            unit_soc[scenario] = soc
+            if coeffs_full is not None:
+                qp_coeffs[scenario] = coeffs_full
+
+    result = [unit_p, unit_q]
     if return_soc:
-        if return_detail:
-            return unit_p, unit_q, unit_soc, intermediates
-        return unit_p, unit_q, unit_soc
+        result.append(unit_soc)
+    if return_coeffs:
+        result.append(qp_coeffs)
     if return_detail:
-        return unit_p, unit_q, intermediates
-    return unit_p, unit_q
+        result.append(intermediates)
+    return tuple(result)
 
 
 # ============================================================
@@ -673,6 +805,53 @@ def _run_schedule_ac(unit_p, unit_q, b, S, E, *, collect_voltage=False):
     )
 
 
+def _qp_diag_vs_ac_loss(
+    coeffs_by_scenario,
+    unit_p,
+    unit_q,
+    base_loss,
+    loss_ess,
+    unit_loss_pcs,
+):
+    """Compare QP diagonal feeder-loss prediction with simultaneous AC loss.
+
+    The five-coefficient model predicts incremental feeder loss relative to
+    zero ESS injection, so the matching base feeder loss is added before the
+    comparison.  AC feeder loss excludes PCS conversion loss.
+    """
+    diagnostics = {}
+    for scenario in PM.ALL_DAYS:
+        qp_increment_mw = _loss_cost_model_by_time(
+            coeffs_by_scenario[scenario],
+            unit_p[scenario],
+            unit_q[scenario],
+        )
+        qp_diag_loss_mw = (
+            np.asarray(base_loss[scenario], dtype=float) + qp_increment_mw
+        )
+        ac_actual_loss_mw = (
+            np.asarray(loss_ess[scenario], dtype=float)
+            - np.asarray(unit_loss_pcs[scenario], dtype=float).sum(axis=0)
+        )
+        qp_total = float(np.sum(qp_diag_loss_mw) * PM.DT_HOURS)
+        ac_total = float(np.sum(ac_actual_loss_mw) * PM.DT_HOURS)
+        cross_effect = ac_total - qp_total
+        cross_effect_pct = (
+            cross_effect / ac_total * 100.0
+            if abs(ac_total) > 1e-15
+            else float("nan")
+        )
+        diagnostics[scenario] = {
+            "qp_diag_loss_mw": qp_diag_loss_mw,
+            "ac_actual_loss_mw": ac_actual_loss_mw,
+            "qp_diag_loss_total": qp_total,
+            "ac_actual_loss_total": ac_total,
+            "cross_effect": cross_effect,
+            "cross_effect_pct": cross_effect_pct,
+        }
+    return diagnostics
+
+
 def _accounting_values(base_flow, p_slack_ess, S, E):
     """기존 benefits 함수만 조립해 새 피크일 회계의 편익 값을 반환한다."""
     smp_mwh = PM.SMP_PER_MWH
@@ -733,19 +912,28 @@ def evaluate_particle(
         'collect_diagnostics=True는 return_detail=True와 함께 써야 함'
     )
     diagnostic_error = ''
+    qp_diag_coeffs = None
     if collect_diagnostics:
         try:
-            unit_p, unit_q, intermediates = _solve_unit_schedules(
+            unit_p, unit_q, qp_diag_coeffs, intermediates = _solve_unit_schedules(
                 b, S, E, base_p.sum(), return_detail=True,
+                return_coeffs=True,
                 force_q_zero=force_q_zero,
             )
         except Exception as exc:
             # 계측(X2/전압) 실패는 최적해 평가를 죽이지 않는다. 기존 X1 경로로 재시도한다.
             diagnostic_error = f'{type(exc).__name__}: {exc}'
-            unit_p, unit_q = _solve_unit_schedules(
-                b, S, E, base_p.sum(), force_q_zero=force_q_zero
+            unit_p, unit_q, qp_diag_coeffs = _solve_unit_schedules(
+                b, S, E, base_p.sum(), return_coeffs=True,
+                force_q_zero=force_q_zero,
             )
             intermediates = None
+    elif return_detail:
+        unit_p, unit_q, qp_diag_coeffs = _solve_unit_schedules(
+            b, S, E, base_p.sum(), return_coeffs=True,
+            force_q_zero=force_q_zero,
+        )
+        intermediates = None
     else:
         unit_p, unit_q = _solve_unit_schedules(
             b, S, E, base_p.sum(), force_q_zero=force_q_zero
@@ -787,6 +975,15 @@ def evaluate_particle(
 
     if not return_detail:
         return fitness
+
+    qp_diag_loss_vs_ac = _qp_diag_vs_ac_loss(
+        qp_diag_coeffs,
+        unit_p,
+        unit_q,
+        base_flow['loss'],
+        loss_ess,
+        unit_loss_pcs,
+    )
 
     p_ch_agg = {s: np.maximum(-unit_p[s], 0.0).sum(axis=0) for s in PM.AVG_DAYS}
     p_dis_agg = {s: np.maximum(unit_p[s], 0.0).sum(axis=0) for s in PM.AVG_DAYS}
@@ -958,6 +1155,7 @@ def evaluate_particle(
         recompute_convergence_ratio=recompute_convergence_ratio,
         recompute_max_p_shift=recompute_max_p_shift,
         recompute_time_diag=recompute_time_diag,
+        qp_diag_loss_vs_ac=qp_diag_loss_vs_ac,
         diagnostic_error=diagnostic_error,
         b=b, S=S, E=E,
     )

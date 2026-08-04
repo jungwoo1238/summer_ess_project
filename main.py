@@ -76,6 +76,10 @@ RUN_FIELDS = [
     'b_arb_total', 'b_loss_total', 'cost',
     'v_violation', 'i_violation', 'penalty_v', 'penalty_line', 'decomposition_ok',
     'recompute_jnet_delta', 'recompute_convergence_ratio', 'recompute_max_p_shift',
+    'cross_effect_pct_avg_max', 'cross_effect_pct_peak_max',
+    # 컬럼명은 명령안 호환을 위해 mw를 유지하지만 evaluate의 cross_effect 단위는 MWh다.
+    'cross_effect_mw_avg_total', 'cross_effect_mw_peak_total',
+    'cross_effect_won_avg_annual',
     'coef_cache_hit_rate', 'coef_runpp_total', 'coef_unique_bs_count',
     'coef_measure_wall_s',
 ]
@@ -364,7 +368,10 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
             b_arb_total='', b_loss_total='', cost='',
             v_violation='', i_violation='', penalty_v='', penalty_line='', decomposition_ok='',
             recompute_jnet_delta='', recompute_convergence_ratio='',
-            recompute_max_p_shift='', coef_cache_hit_rate='',
+            recompute_max_p_shift='', cross_effect_pct_avg_max='',
+            cross_effect_pct_peak_max='', cross_effect_mw_avg_total='',
+            cross_effect_mw_peak_total='', cross_effect_won_avg_annual='',
+            coef_cache_hit_rate='',
             coef_runpp_total='', coef_unique_bs_count='', coef_measure_wall_s='',
         )
 
@@ -379,6 +386,47 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
               f'(차이={diff:.4e}원 > 허용오차 {RUN_CONSISTENCY_ATOL_WON}원). '
               'evaluate.py 로직 변경이나 편익 분해 코드의 버그를 의심할 것.', flush=True)
 
+    qp_diag = detail.get('qp_diag_loss_vs_ac') or {}
+    required_scenarios = set(PM.ALL_DAYS)
+    if not required_scenarios.issubset(qp_diag):
+        cross_fields = dict(
+            cross_effect_pct_avg_max='', cross_effect_pct_peak_max='',
+            cross_effect_mw_avg_total='', cross_effect_mw_peak_total='',
+            cross_effect_won_avg_annual='',
+        )
+    else:
+        cross_fields = dict(
+            cross_effect_pct_avg_max=max(
+                abs(float(qp_diag[s]['cross_effect_pct']))
+                for s in PM.AVG_DAYS
+            ),
+            cross_effect_pct_peak_max=max(
+                abs(float(qp_diag[s]['cross_effect_pct']))
+                for s in PM.PEAK_DAYS
+            ),
+            # cross_effect = sum_t(loss_MW)*DT_HOURS, 따라서 실제 단위는 MWh.
+            cross_effect_mw_avg_total=sum(
+                float(qp_diag[s]['cross_effect']) for s in PM.AVG_DAYS
+            ),
+            cross_effect_mw_peak_total=sum(
+                float(qp_diag[s]['cross_effect']) for s in PM.PEAK_DAYS
+            ),
+            cross_effect_won_avg_annual=sum(
+                float(
+                    np.sum(
+                        (
+                            np.asarray(qp_diag[s]['ac_actual_loss_mw'], dtype=float)
+                            - np.asarray(qp_diag[s]['qp_diag_loss_mw'], dtype=float)
+                        )
+                        * np.asarray(PM.SMP_PER_MWH[s], dtype=float)
+                    )
+                    * PM.DT_HOURS
+                    * PM.N_WEEKDAYS[s]
+                )
+                for s in PM.AVG_DAYS
+            ),
+        )
+
     return dict(
         j_net=detail['j_net'], b_energy=detail['b_energy'], b_defer=detail['b_defer'],
         b_arb=detail['b_arb'], b_loss=detail['b_loss'],
@@ -392,6 +440,7 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
             'recompute_convergence_ratio', float('nan')
         ),
         recompute_max_p_shift=detail.get('recompute_max_p_shift', float('nan')),
+        **cross_fields,
         coef_cache_hit_rate=detail.get('coef_cache_hit_rate', float('nan')),
         coef_runpp_total=detail.get('coef_runpp_total', float('nan')),
         coef_unique_bs_count=detail.get('coef_unique_bs_count', float('nan')),

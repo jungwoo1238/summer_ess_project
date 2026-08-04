@@ -154,7 +154,7 @@ PROBLEM_CACHE_MAXSIZE = 16
 
 # 손실계수 측정 결과 LRU 캐시 상한. 엔트리는 시각별 계수·진단 스칼라로
 # Problem보다 훨씬 가벼우므로 현재 상한을 유지한다.
-MEASURED_CACHE_MAXSIZE = 65536
+MEASURED_CACHE_MAXSIZE = 262144
 
 # ============================================================
 # 4. CRF · 비용 · 편익 확정 파라미터 (CLAUDE.md 4절, 부록B)
