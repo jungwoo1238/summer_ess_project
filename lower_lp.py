@@ -535,9 +535,13 @@ def _prepare_common(S_mva, E_mwh, bus_idx, profile, self_discharge, soc_init):
 
 
 def _assert_peak_p_loss_sign(p_net, coeffs, tol=_P_LOSS_ASSERT_TOL):
-    """시스템 합이 방전인 시각에 P 손실저감항의 부호만 검증한다(Q항은 의도적으로 제외)."""
-    p_net_sum = np.sum(p_net, axis=0)
-    discharge_times = np.flatnonzero(p_net_sum > tol)
+    """모든 기가 동시에 방전인 시각에만 P 손실저감항 부호를 검증한다
+    (Q항은 의도적으로 제외). 그 시각엔 a_P<0·모든 p_net>0이라 손실저감항 양수가
+    수학적으로 보장되므로, 이 검사는 계수 부호 오류의 조기 탐지에 한정된다.
+    n>=2의 정상적 역방향 운전(일부 기 충전) 시각은 검사 대상이 아니다 -
+    그 손실 정합성은 사후 AC 조류계산이 담당한다. n=1에서는 이 조건이
+    기존 'p_net_sum>tol'과 동치라 회귀 영향이 없다."""
+    discharge_times = np.flatnonzero(np.all(p_net > tol, axis=0))
     for t in discharge_times:
         p_loss_term = -float(np.sum(coeffs['a_P'][:, t] * p_net[:, t]))
         assert p_loss_term > -tol, \

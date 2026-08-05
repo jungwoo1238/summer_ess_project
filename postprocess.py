@@ -106,6 +106,7 @@ OPTIONAL_NUMERIC_RUN_FIELDS = [
     'cross_effect_pct_avg_max', 'cross_effect_pct_peak_max',
     'cross_effect_mw_avg_total', 'cross_effect_mw_peak_total',
     'cross_effect_won_avg_annual',
+    'capex_power_annual', 'capex_energy_annual', 'opex',
 ]
 
 
@@ -130,11 +131,14 @@ def load_runs_csv(path):
     for row in rows:
         rec = {}
         for k in NUMERIC_RUN_FIELDS:
-            if k not in row:
+            # runs.csv 신규 스키마는 AVG_DAYS 손실편익을 b_loss_avg로 명시한다.
+            # 내부 키 r['b_loss']는 기존 계산 코드를 유지하며, 구 CSV의 b_loss도 계속 읽는다.
+            source_key = 'b_loss_avg' if k == 'b_loss' and 'b_loss_avg' in row else k
+            if source_key not in row:
                 missing_cols.add(k)
                 rec[k] = None
             else:
-                rec[k] = _to_float(row[k])
+                rec[k] = _to_float(row[source_key])
         # 다기 진단은 신규 optional 스키마다. 구 CSV에서 없어도 기존 결측 보고와
         # n=1 출력이 바뀌지 않도록 missing_cols에는 넣지 않는다.
         for k in OPTIONAL_NUMERIC_RUN_FIELDS:
@@ -241,9 +245,9 @@ def _money_isclose(actual, expected):
 # (1) 편익 분해 + 검산
 # ============================================================
 
-def check_decomposition(b_arb, b_loss, b_energy):
-    """b_arb+b_loss ~= b_energy."""
-    lhs = b_arb + b_loss
+def check_decomposition(b_arb, b_loss_component, b_energy):
+    """같은 회계범위의 b_arb+b_loss_component ~= b_energy."""
+    lhs = b_arb + b_loss_component
     ok = _money_isclose(lhs, b_energy)
     rule = (f'atol={DECOMP_ATOL_NEAR_ZERO}(기대값~0)' if abs(b_energy) < MONEY_NEAR_ZERO_WON
             else f'rtol={DECOMP_RTOL}')
@@ -251,7 +255,8 @@ def check_decomposition(b_arb, b_loss, b_energy):
 
 
 def compute_gross_shares(r):
-    """① 분모를 총편익 B_gross=b_defer+b_energy(=b_defer+b_arb+b_loss)로 바꾼다 - j_net(순편익)
+    """① 분모를 총편익 B_gross=b_defer+b_energy
+    (=b_defer+b_arb_total+b_loss_total)로 바꾼다 - j_net(순편익)
     대비 비율은 세 항의 합이 100%가 되지 않아(cost 항이 빠져 있음) 물리적 의미가 없었다.
 
     두 경로로 계산한 B_gross가 일치하는지(교차검증), 세 share의 합이 100%인지를 hard assert로
@@ -304,6 +309,32 @@ def compute_gross_shares(r):
                 cost_pct=cost_pct)
 
 
+def _annual_cost_components(run, n_ess):
+    """runs.csv의 설비값으로 기존 연간 cost를 출력·용량·운영비 3항으로 분해한다."""
+    component_fields = ('capex_power_annual', 'capex_energy_annual', 'opex')
+    if all(run.get(field) is not None for field in component_fields):
+        components = {field: run[field] for field in component_fields}
+    else:
+        # 구 runs.csv에는 분해 열이 없으므로 x_json의 총 S·E에서 동일 식으로 재계산한다.
+        units = parse_units(run['x'], n_ess)
+        s_total = sum(S for _b, S, _E in units)
+        e_total = sum(E for _b, _S, E in units)
+        components = dict(
+            capex_power_annual=PM.CRF_20 * PM.C_KW_CAPEX_PER_MVA * s_total,
+            capex_energy_annual=PM.CRF_20 * PM.C_KWH_CAPEX_PER_MWH * e_total,
+            opex=benefits.opex(s_total, e_total),
+        )
+    component_sum = sum(components.values())
+    if not np.isclose(component_sum, run['cost'], rtol=1e-9, atol=0.0):
+        print(
+            f"  ★ 경고: cost 3분해 불일치(run={run.get('run')}): "
+            f"components={component_sum:.12g} vs cost={run['cost']:.12g}, "
+            f"diff={component_sum - run['cost']:+.12g}원; 후처리는 계속합니다.",
+            flush=True,
+        )
+    return components
+
+
 def section1_benefit_decomposition(group):
     section(f"(1) 편익 분해 - n_ess={group['n_ess']}")
     runs = group['runs']
@@ -315,15 +346,29 @@ def section1_benefit_decomposition(group):
 
     degenerate = [r for r in runs if r['j_net'] < DEGENERATE_J_NET_WON]
     normal = [r for r in runs if r['j_net'] >= DEGENERATE_J_NET_WON]
+    cost_components = {
+        r['run']: _annual_cost_components(r, group['n_ess']) for r in runs
+    }
     print(f'  전체 {len(runs)}건 중 탐색실패(전 기 소멸, j_net<{DEGENERATE_J_NET_WON:.0e}원) '
           f'{len(degenerate)}건, 정상 {len(normal)}건', flush=True)
 
     for label, subset in (('전체(탐색실패 포함)', runs), ('정상만(탐색실패 제외)', normal)):
         print(f'  [{label}, n={len(subset)}]', flush=True)
-        for field in ('j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss', 'cost'):
-            _print_stats(field, _stats([r[field] for r in subset]), '원')
+        for field, output_name in (
+            ('j_net', 'j_net'), ('b_energy', 'b_energy'),
+            ('b_defer', 'b_defer'), ('b_arb', 'b_arb'),
+            ('b_loss', 'b_loss_avg'), ('cost', 'cost'),
+        ):
+            _print_stats(output_name, _stats([r[field] for r in subset]), '원')
+        for field in ('capex_power_annual', 'capex_energy_annual', 'opex'):
+            _print_stats(
+                field,
+                _stats([cost_components[r['run']][field] for r in subset]),
+                '원',
+            )
 
-    # ① 편익 share: 분모는 총편익 B_gross=b_defer+b_energy(=b_defer+b_arb+b_loss)다. j_net(순편익)을
+    # ① 편익 share: 분모는 총편익 B_gross=b_defer+b_energy
+    # (=b_defer+b_arb_total+b_loss_total)다. j_net(순편익)을
     # 분모로 쓰면 cost 항이 빠져 있어 세 항의 합이 100%가 되지 않는다(물리적 의미 없음 - 이전
     # 버전의 오류). compute_gross_shares가 run마다 assert로 100% 분해를 강제한다.
     gross_normal = [compute_gross_shares(r) for r in normal]
@@ -333,12 +378,12 @@ def section1_benefit_decomposition(group):
     for label, gross_list in (('정상만(기본값)', gross_normal), ('전체(_all, 참고)', gross_all)):
         print(f'    [{label}]', flush=True)
         for key, name in (('defer_pct', 'b_defer'), ('arb_pct', 'b_arb'),
-                           ('loss_pct', 'b_loss'), ('cost_pct', 'cost')):
+                           ('loss_pct', 'b_loss_total'), ('cost_pct', 'cost')):
             _print_stats(f'{name}/B_gross', _stats([g[key] for g in gross_list]), '%')
     print('  (주의: compute_gross_shares의 assert는 run 하나하나가 정확히 100%로 분해되는지를 '
           '보장할 뿐이다. 위에 찍힌 median은 run별 share를 각각 모아 median을 낸 값이라, median의 '
           '합 자체가 100%일 필요는 없다 - median은 선형연산이 아니다.)', flush=True)
-    print('  (예상: b_defer >> b_arb > b_loss)', flush=True)
+    print('  (예상: b_defer >> b_arb_total > b_loss_total)', flush=True)
 
     bad = []
     skipped = []
@@ -356,7 +401,7 @@ def section1_benefit_decomposition(group):
         if not ok:
             bad.append((r['run'], diff, rule))
     if bad:
-        print(f'  ★ b_arb+b_loss≈b_energy 위반 {len(bad)}건:', flush=True)
+        print(f'  ★ b_arb_total+b_loss_total≈b_energy 위반 {len(bad)}건:', flush=True)
         for run_idx, diff, rule in bad:
             print(f'    run={run_idx}  차이={diff:+.4f}원 ({rule})', flush=True)
     else:
@@ -485,7 +530,7 @@ def compute_schedules(installed_units):
     evaluate._ensure_worker_state()
     base_p_sum = float(evaluate._BASE_P.sum())
     # scenario -> [(P_net[T], soc[T+1], Q[T]) per unit]. ★ CMD_diagnose_bloss.md 작업A -
-    # Q도 함께 들고 다닌다(기존엔 버렸음 - 그래서 b_loss 진단이 슬랙 차이로 역추론해야 했다).
+    # Q도 함께 들고 다닌다(기존엔 버렸음 - 그래서 b_loss_avg 진단이 슬랙 차이로 역추론해야 했다).
     schedules = {s: [] for s in PM.ALL_DAYS}
     if not installed_units:
         return schedules, base_p_sum
@@ -517,11 +562,14 @@ def _efc(P_net, E_rated_mwh):
     return float(np.sum(np.abs(P_net)) * PM.DT_HOURS / (2.0 * e_usable))
 
 
-def section3_4_efc(group, all_units, installed_units, schedules):
+def section3_4_efc(group, all_units, installed_units, schedules, peak_day):
     section(f"(3)-4 EFC (등가 전 사이클) - n_ess={group['n_ess']}")
     if not installed_units:
         print('  설치된 기 없음 - 생략', flush=True)
         return None
+    assert peak_day in PM.PEAK_DAYS, f'회계 peak_day가 PEAK_DAYS에 없음: {peak_day!r}'
+    adjusted_season = benefits.PEAK_TO_SEASON[peak_day]
+    assert PM.N_WEEKDAYS[adjusted_season] - 1.0 >= 0.0
 
     # ③ 기별 EFC. all_units(소멸 기 포함) 순서를 그대로 훑되, installed_units(=schedules와 같은
     # 순서로 필터링된 목록)에 없는 것(S<=0)은 EFC=NaN으로 두고 active 집계에서 제외한다.
@@ -533,19 +581,30 @@ def section3_4_efc(group, all_units, installed_units, schedules):
         if not is_active:
             results.append(dict(unit_idx=full_idx, b=b, E=E, active=False,
                                  annual_efc=float('nan'), worst_case_annual_efc=float('nan'),
-                                 peak_efc={s: float('nan') for s in PM.PEAK_DAYS}))
+                                 peak_efc={s: float('nan') for s in PM.PEAK_DAYS},
+                                 peak_day=peak_day, adjusted_season=adjusted_season))
             continue
 
         i = inst_idx   # installed_units/schedules 쪽 인덱스 (all_units에서 소멸 기를 건너뛴 순서)
         inst_idx += 1
+        # 회계(_accounting_values)와 정합: select_peak_day가 고른 peak 하나만 반영한다.
+        # 선택 계절 평일 1일을 peak일로 대체하고, 선택되지 않은 peak은 연간합에서 버린다.
         annual_efc = 0.0
         for s in PM.AVG_DAYS:
             P_net, _soc, _q = schedules[s][i]
-            annual_efc += PM.N_WEEKDAYS[s] * _efc(P_net, E)
+            avg_efc = _efc(P_net, E)
+            weight = PM.N_WEEKDAYS[s] - (
+                1.0 if s == adjusted_season else 0.0
+            )
+            annual_efc += weight * avg_efc
+        peak_P_net = schedules[peak_day][i][0]
+        annual_efc += _efc(peak_P_net, E)
         peak_efc = {s: _efc(schedules[s][i][0], E) for s in PM.PEAK_DAYS}
+        # peak 대체는 총 평일수 247일을 바꾸지 않으므로 기존 365/247 상한 스케일을 유지한다.
         worst_case_annual = annual_efc * (365.0 / PM.TOTAL_WEEKDAYS_PER_YEAR)
         results.append(dict(unit_idx=full_idx, b=b, E=E, active=True, annual_efc=annual_efc,
-                             worst_case_annual_efc=worst_case_annual, peak_efc=peak_efc))
+                             worst_case_annual_efc=worst_case_annual, peak_efc=peak_efc,
+                             peak_day=peak_day, adjusted_season=adjusted_season))
 
     for r in results:
         if not r['active']:
@@ -553,7 +612,7 @@ def section3_4_efc(group, all_units, installed_units, schedules):
                   "is_active=False로 확인 가능)", flush=True)
             continue
         print(f"  기 {r['unit_idx']}(b={r['b']}, E={r['E']:.4f}MWh):", flush=True)
-        print(f"    연간EFC(247일 가중, 주값) = {r['annual_efc']:.2f}회/년  "
+        print(f"    연간EFC(247평일, 선택 peak 1일 포함·회계정합) = {r['annual_efc']:.2f}회/년  "
               f"(Lazard {PM.LAZARD_CYCLES_PER_YEAR}회/년 대비 "
               f"{'과소=활용저조' if r['annual_efc'] < PM.LAZARD_CYCLES_PER_YEAR else '*과다=수명위협 가능'})",
               flush=True)
@@ -562,7 +621,8 @@ def section3_4_efc(group, all_units, installed_units, schedules):
               f"({'350 미만 - 안전' if r['worst_case_annual_efc'] < PM.LAZARD_CYCLES_PER_YEAR else '*350 초과'})",
               flush=True)
         pe = r['peak_efc']
-        print(f"    PEAK_DAYS(연 2일 상당, 가중 제외 별도보고): "
+        print(f"    PEAK_DAYS(참고; {r['peak_day']}가 선택되어 {r['adjusted_season']} 평균일 "
+              f"1일을 대체, 다른 peak은 연간합에서 제외): "
               f"summer_peak={pe.get('summer_peak', float('nan')):.4f}회  "
               f"winter_peak={pe.get('winter_peak', float('nan')):.4f}회", flush=True)
 
@@ -1473,13 +1533,25 @@ def _diagnostic_metrics(
     return metrics
 
 
-def section9_schedule_raw(group, best, operating, schedules, base_p_sum, out_dir, ts):
+def section9_schedule_raw(
+    group,
+    best,
+    operating,
+    schedules,
+    base_p_sum,
+    out_dir,
+    ts,
+    slack_context=None,
+):
     section(f"(9) 스케줄 원자료 저장 - n_ess={group['n_ess']}")
     installed = operating['installed']
 
-    slack_base, slack_ess, detail = get_slack_via_evaluate(
-        operating['units'], group['n_ess']
-    )
+    if slack_context is None:
+        slack_base, slack_ess, detail = get_slack_via_evaluate(
+            operating['units'], group['n_ess']
+        )
+    else:
+        slack_base, slack_ess, detail = slack_context
     slack_ess_qzero = compute_slack_qzero(installed, schedules)
     if slack_ess_qzero is not None and slack_ess is not None:
         q_only_mw = sum(float(np.sum(slack_ess_qzero[s] - slack_ess[s])) for s in PM.ALL_DAYS)
@@ -1499,7 +1571,7 @@ def section9_schedule_raw(group, best, operating, schedules, base_p_sum, out_dir
             print(f'    {s:12s}: {day_mwh:.4f} MWh/일{tag}', flush=True)
             if s in PM.AVG_DAYS:
                 annual_avg_mwh += PM.N_WEEKDAYS[s] * day_mwh
-        print(f'  AVG_DAYS 연간 합계(N_WD 가중, b_loss와 같은 가중치) = {annual_avg_mwh:.2f} MWh/년',
+        print(f'  AVG_DAYS 연간 합계(N_WD 가중, b_loss_avg와 같은 가중치) = {annual_avg_mwh:.2f} MWh/년',
               flush=True)
 
     validate_schedules(installed, schedules)
@@ -1605,9 +1677,23 @@ def process_group(runs_path, out_dir, ts):
     schedules = None
     base_p_sum = None
     efc_result = None
+    slack_context = None
     if operating is not None and operating.get('installed'):
         schedules, base_p_sum = compute_schedules(operating['installed'])
-        efc_result = section3_4_efc(group, operating['units'], operating['installed'], schedules)
+        # (9)절에서 원래 수행하던 최적해 상세 재평가를 한 번만 앞당겨, 회계가 실제 사용한
+        # detail['peak_day']를 EFC와 schedule 진단이 공유한다(추가 AC 평가 없음).
+        slack_context = get_slack_via_evaluate(operating['units'], group['n_ess'])
+        _slack_base, _slack_ess, accounting_detail = slack_context
+        if accounting_detail is None:
+            print('  ★ 회계 peak_day 확보 불가 - (3)-4 EFC 생략', flush=True)
+        else:
+            efc_result = section3_4_efc(
+                group,
+                operating['units'],
+                operating['installed'],
+                schedules,
+                accounting_detail['peak_day'],
+            )
 
     bus_dist = section3_5_bus_distribution(group, decomp)
     section3_6_q_ratio(group)
@@ -1629,7 +1715,7 @@ def process_group(runs_path, out_dir, ts):
         similarity_result = section8_schedule_similarity(group, operating['units'],
                                                            operating['installed'], schedules)
         schedule9_result = section9_schedule_raw(group, best, operating, schedules, base_p_sum,
-                                                  out_dir, ts)
+                                                  out_dir, ts, slack_context=slack_context)
 
     return dict(
         n_ess=group['n_ess'], group=group, decomp=decomp, cost_check=cost_check, best=best,
@@ -1729,8 +1815,8 @@ RUN_SUMMARY_FIELDS = [
     'b_defer_share_of_gross_pct_all', 'b_defer_share_of_gross_pct_all_mean',
     'b_arb_share_of_gross_pct', 'b_arb_share_of_gross_pct_mean',
     'b_arb_share_of_gross_pct_all', 'b_arb_share_of_gross_pct_all_mean',
-    'b_loss_share_of_gross_pct', 'b_loss_share_of_gross_pct_mean',
-    'b_loss_share_of_gross_pct_all', 'b_loss_share_of_gross_pct_all_mean',
+    'b_loss_total_share_of_gross_pct', 'b_loss_total_share_of_gross_pct_mean',
+    'b_loss_total_share_of_gross_pct_all', 'b_loss_total_share_of_gross_pct_all_mean',
     'cost_to_gross_ratio_pct', 'cost_to_gross_ratio_pct_mean',
     'cost_to_gross_ratio_pct_all', 'cost_to_gross_ratio_pct_all_mean',
     'decomposition_violations', 'cost_check_ok',
@@ -1792,10 +1878,10 @@ def build_run_summary_row(result):
         b_arb_share_of_gross_pct_mean=gross_stat('arb_pct', gn, 'mean') if decomp else '',
         b_arb_share_of_gross_pct_all=gross_stat('arb_pct', ga, 'median') if decomp else '',
         b_arb_share_of_gross_pct_all_mean=gross_stat('arb_pct', ga, 'mean') if decomp else '',
-        b_loss_share_of_gross_pct=gross_stat('loss_pct', gn, 'median') if decomp else '',
-        b_loss_share_of_gross_pct_mean=gross_stat('loss_pct', gn, 'mean') if decomp else '',
-        b_loss_share_of_gross_pct_all=gross_stat('loss_pct', ga, 'median') if decomp else '',
-        b_loss_share_of_gross_pct_all_mean=gross_stat('loss_pct', ga, 'mean') if decomp else '',
+        b_loss_total_share_of_gross_pct=gross_stat('loss_pct', gn, 'median') if decomp else '',
+        b_loss_total_share_of_gross_pct_mean=gross_stat('loss_pct', gn, 'mean') if decomp else '',
+        b_loss_total_share_of_gross_pct_all=gross_stat('loss_pct', ga, 'median') if decomp else '',
+        b_loss_total_share_of_gross_pct_all_mean=gross_stat('loss_pct', ga, 'mean') if decomp else '',
         cost_to_gross_ratio_pct=gross_stat('cost_pct', gn, 'median') if decomp else '',
         cost_to_gross_ratio_pct_mean=gross_stat('cost_pct', gn, 'mean') if decomp else '',
         cost_to_gross_ratio_pct_all=gross_stat('cost_pct', ga, 'median') if decomp else '',

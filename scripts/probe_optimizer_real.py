@@ -27,7 +27,10 @@ from probe_optimizer_bench import ABCBench, LSHADEBench, PSOBench
 POP = 32
 EVAL_BUDGET = POP * 31
 N_RUNS = 8
-N_WORKERS = MAIN.DEFAULT_N_WORKERS
+# This benchmark creates a fresh pool per algorithm.  Eight workers is the
+# memory-safe ceiling on the target desktop; the project-wide default is not
+# used here because 16 concurrent QP/pandapower workers exhaust memory.
+N_WORKERS = 8
 SEEDS = tuple(range(N_RUNS))
 
 ALGORITHMS = (

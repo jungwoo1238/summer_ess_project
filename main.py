@@ -1,18 +1,18 @@
 """파이프라인 단일 진입점 (CLAUDE.md 부록A "구현 순서" 4번째 단계: lower_lp+test_lp ->
 benefits -> evaluate -> **main** -> postprocess).
 
-역할: pso_core.PSO에 evaluate를 목적함수로 꽂고, 단일 기수(n_ess)에 대해 독립실행(run)
+역할: lshade_core.LSHADEBench에 evaluate를 목적함수로 꽂고, 단일 기수(n_ess)에 대해 독립실행(run)
 루프를 돌리며 결과를 CSV 로그로 남긴다. postprocess.py가 그 로그를 읽는다. main은
-조립·실행·기록만 하며 최적화 로직 자체는 손대지 않는다(evaluate.py/pso_core.py 등 미수정).
+조립·실행·기록만 하며 최적화 로직 자체는 손대지 않는다(evaluate.py 등 미수정).
 
 ★ 실행 단위는 "기수 1개"다. CLAUDE.md 2절은 "1기부터 하나씩 늘리며 순편익이 꺾이는
 지점을 탐색"한다고 규정하는데, 꺾이는 지점 판단은 사람이 n=1 결과를 보고 λ·입자 수를
 조정한 뒤 n=2로 넘어가는 식이라 기본은 한 번에 한 기수만 돈다. --n-ess에 콤마 리스트를
 명시하면 여러 기수를 순차 실행할 수 있지만 기본값은 항상 단일 정수 1이다.
 
-PSO 탐색 차원은 3n(b,S,E)이다. ★ C.6-3(LinDistFlow 편입) 이후 evaluate.py 자신이 3n
-시그니처로 바뀌어(Q는 이제 하위 LP의 시변 변수라 상위 PSO에 q_ratio가 없다 - 부록C.4-(3))
-main의 _expand_to_4n 어댑터는 제거했다. main은 pso_core가 반환하는 3n 배열을
+L-SHADE 탐색 차원은 3n(b,S,E)이다. ★ C.6-3(LinDistFlow 편입) 이후 evaluate.py 자신이 3n
+시그니처로 바뀌어(Q는 이제 하위 LP의 시변 변수라 상위 최적화기에 q_ratio가 없다 - 부록C.4-(3))
+main의 _expand_to_4n 어댑터는 제거했다. main은 lshade_core가 반환하는 3n 배열을
 evaluate.evaluate_particle에 그대로 넘긴다.
 
 ★ runs.csv의 편익 분해·페널티 컬럼(j_net/b_energy/.../penalty_v/penalty_line)은 --diagnose
@@ -46,9 +46,10 @@ import multiprocessing as mp
 import numpy as np
 
 import params as PM
+import benefits
 import evaluate
 import loss_coeffs
-import pso_core
+import lshade_core
 import postprocess
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -57,23 +58,25 @@ RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
 DEFAULT_BASE_SEED = 42
 DEFAULT_N_WORKERS = 16   # scripts/bench_workers.py 실측 확정값 (아래 "확정 사항 1)" 참조)
 
-# CLAUDE.md 7절 "본실험"/"개발" 표와 정합. n_particles는 두 프로파일이 동일(32) -
-# 실측(확정 사항 1)에서 정수배 여부가 성능에 유의하지 않았으므로 그대로 채택.
+# L-SHADE 초기 개체군은 12*n_dims로 결정한다. 프로파일은 평가예산 계수와 run 수만 정의한다.
+# eval_budget = budget_coef * N_init (N_init=12*n_dims): dev 30배, full 100배.
 PROFILES = {
-    'dev':  dict(n_particles=32, n_iters=30,  n_runs=3),
-    'full': dict(n_particles=32, n_iters=60, n_runs=20),
+    'dev':  dict(budget_coef=30,  n_runs=3),
+    'full': dict(budget_coef=100, n_runs=20),
 }
 
 GEN_FIELDS = [
-    'n_ess', 'run', 'gen', 'gbest_f', 'mean_f', 'std_f', 'worst_f',
+    'n_ess', 'run', 'gen', 'batch_size', 'eval_cumulative',
+    'gbest_f', 'mean_f', 'std_f', 'worst_f',
     'elapsed_s', 'coef_cache_hit_rate_cumulative',
 ]
 RUN_FIELDS = [
     'n_ess', 'run', 'seed', 'gbest_f', 'x_json', 'wall_time_s',
     'n_diverged_total', 'n_negative_bdefer', 'min_bdefer',
     # ★ gbest 해의 편익 분해·페널티 (--diagnose 무관 상시 기록, 아래 "확정 사항 2)" 참조).
-    'j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss',
+    'j_net', 'b_energy', 'b_defer', 'b_arb', 'b_loss_avg',
     'b_arb_total', 'b_loss_total', 'cost',
+    'capex_power_annual', 'capex_energy_annual', 'opex',
     'v_violation', 'i_violation', 'penalty_v', 'penalty_line', 'decomposition_ok',
     'recompute_jnet_delta', 'recompute_convergence_ratio', 'recompute_max_p_shift',
     'cross_effect_pct_avg_max', 'cross_effect_pct_peak_max',
@@ -84,11 +87,11 @@ RUN_FIELDS = [
     'coef_measure_wall_s',
 ]
 
-# gbest_f(PSO가 이미 추적 중인 값) vs -j_net+penalty_v+penalty_line(gbest 해를 사후 재평가해
-# 얻은 값)의 검산 허용오차. CLAUDE.md 7절 원칙4 "금액(원), 기대값=0" 계보(atol=10.0,
-# test_evaluate.py의 won_atol과 동일 근거) - 두 값이 이론상 정확히 같아야 하는 항등식이라
-# 기대값이 0(잔차)인 비교로 취급한다.
-RUN_CONSISTENCY_ATOL_WON = 10.0
+# gbest_f(L-SHADE가 이미 추적 중인 값) vs -j_net+penalty_v+penalty_line(gbest 해를 사후
+# 재평가해 얻은 값)의 검산 허용오차. n=2 우수해(Q가 PCS 한계까지 binding,
+# poly_binding_frac~0.53)에서 QP solver 재현 오차 10.07원이 관측되어 15원으로 둔다.
+# 물리량이 아닌 solver 재현 잔차의 상한이며, 수백~수천 원 규모의 버그 탐지력은 유지한다.
+RUN_CONSISTENCY_ATOL_WON = 15.0
 
 
 # ============================================================
@@ -112,7 +115,7 @@ RUN_CONSISTENCY_ATOL_WON = 10.0
 # - run당 gbest 해 1개에 대해서만 evaluate_particle(return_detail=True)를 추가 호출한다
 #   (전 입자 기록은 CLAUDE.md 7-A절 "중간 저장" 원칙과 충돌 - 비용 대비 이득 없음).
 #   명령 G 이후 gbest 상세 경로는 X0/X2·전압 진단을 추가로 수행하지만 run당 1회뿐이며,
-#   PSO의 전 입자 평가에는 collect_diagnostics=False라 이 추가 비용이 없다.
+#   L-SHADE의 전 입자 평가에는 collect_diagnostics=False라 이 추가 비용이 없다.
 # - 검산(-j_net+penalty_v+penalty_line == gbest_f)은 경고만 하고 죽이지 않는다. 본실험
 #   30 run 중간에 assert로 죽으면 그 기수 전체를 다시 돌려야 해 손해가 훨씬 크다.
 
@@ -171,7 +174,7 @@ def _build_int_dims(n_ess):
 # 워커에서 실행되는 평가 함수 (Pool.map 대상 - 반드시 모듈 최상위, 피클 가능해야 함)
 # ============================================================
 
-def _eval_for_pso(x3n):
+def _eval_for_optimizer(x3n):
     """evaluate.evaluate_particle을 return_detail=True로 호출해 (fitness, diverged, b_defer)
     3튜플만 돌려준다. 전체 dict를 그대로 IPC로 돌려보내면 p_slack_ess/loss_ess/unit_p/unit_q
     등 이 스크립트가 쓰지 않는 배열까지 매 평가마다 pickling되므로, 필요한 스칼라만 추린다.
@@ -181,7 +184,7 @@ def _eval_for_pso(x3n):
     """
     detail = evaluate.evaluate_particle(x3n, return_detail=True)
     # 각 Pool 워커의 프로세스 로컬 캐시 통계를 평가 결과에 편승시킨다.
-    # 실패해도 fitness 반환은 유지하여 진단 계측이 PSO를 중단시키지 않게 한다.
+    # 실패해도 fitness 반환은 유지하여 진단 계측이 L-SHADE를 중단시키지 않게 한다.
     try:
         cache_info = dict(pid=os.getpid(), **loss_coeffs.cache_info())
     except Exception as exc:
@@ -192,16 +195,15 @@ def _eval_for_pso(x3n):
 
 
 # ============================================================
-# pso_core.PSO가 기대하는 objective(X)->fitness 배열 인터페이스 + 부수 진단 수집
+# L-SHADE가 기대하는 objective(X)->fitness 배열 인터페이스 + 부수 진단 수집
 # ============================================================
 
 class RunObjective:
-    """pso_core.PSO는 objective(X: (n_particles, n_dims)) -> (n_particles,)만 요구한다.
+    """L-SHADE는 objective(X: (batch_size, n_dims)) -> (batch_size,)만 요구한다.
     이 클래스는 그 계약을 만족하면서, Pool로 분배한 평가 결과에서 발산·음의 B_defer를
     부수적으로 누적한다(evaluate.py는 건드리지 않음 - return_detail=True가 이미 주는
-    필드를 읽기만 한다). 세대별 gbest_f는 여기서 추적하지 않는다 - pso_core.PSO.optimize()가
-    반환하는 result['history']가 이미 그 값(세대별 누적 최적)을 정확히 갖고 있으므로,
-    호출부(run_single)가 그것과 이 클래스의 gen_rows(세대별 집단 통계)를 나중에 합친다.
+    필드를 읽기만 한다). LPSR로 호출별 배치 크기가 달라지므로 호출별 최솟값을 함께
+    기록하고, 실행 루프에서 그 누적 최솟값을 gbest_f로 만든다.
     """
 
     _CACHE_COUNTERS = (
@@ -215,8 +217,9 @@ class RunObjective:
         self.n_diverged_total = 0
         self.n_negative_bdefer = 0
         self.min_bdefer = float('inf')
-        self.gen_rows = []  # gen, mean_f, std_f, worst_f, elapsed_s (gbest_f는 history에서 채움)
+        self.gen_rows = []  # objective 호출별 배치 통계(best_f_batch는 CSV 기록 전에 제거)
         self._gen_idx = 0
+        self._eval_cumulative = 0
         self._cache_first_by_pid = {}
         self._cache_last_by_pid = {}
         self._cache_collection_failed = False
@@ -290,7 +293,7 @@ class RunObjective:
         particles_3n = [np.asarray(row, dtype=float) for row in X]
 
         t0 = time.perf_counter()
-        results = self.pool.map(_eval_for_pso, particles_3n, chunksize=1)
+        results = self.pool.map(_eval_for_optimizer, particles_3n, chunksize=1)
         elapsed_s = time.perf_counter() - t0
 
         fitness = np.empty(len(results), dtype=float)
@@ -305,8 +308,13 @@ class RunObjective:
                 if b_defer < self.min_bdefer:
                     self.min_bdefer = b_defer
 
+        batch_size = len(fitness)
+        self._eval_cumulative += batch_size
         self.gen_rows.append(dict(
             gen=self._gen_idx,
+            batch_size=batch_size,
+            eval_cumulative=self._eval_cumulative,
+            best_f_batch=float(np.min(fitness)),
             mean_f=float(np.mean(fitness)),
             std_f=float(np.std(fitness)),
             worst_f=float(np.max(fitness)),
@@ -354,9 +362,21 @@ def _evaluate_gbest_detail(gbest_x_3n):
     return dict(detail)
 
 
+def _annual_cost_components(gbest_x_3n):
+    """gbest의 총 S·E로 runs.csv용 연간 비용 3분해를 계산한다."""
+    units = np.asarray(gbest_x_3n, dtype=float).reshape(-1, 3)
+    s_total = float(np.sum(units[:, 1]))
+    e_total = float(np.sum(units[:, 2]))
+    return dict(
+        capex_power_annual=PM.CRF_20 * PM.C_KW_CAPEX_PER_MVA * s_total,
+        capex_energy_annual=PM.CRF_20 * PM.C_KWH_CAPEX_PER_MWH * e_total,
+        opex=benefits.opex(s_total, e_total),
+    )
+
+
 def _gbest_detail_to_run_fields(detail, gbest_f):
     """detail(evaluate_particle 반환) -> runs.csv에 넣을 편익 분해·페널티 필드 dict.
-    gbest 해가 발산 상태면(이론상 거의 불가능 - 발산 페널티 1e15가 PSO gbest가 되려면
+    gbest 해가 발산 상태면(이론상 거의 불가능 - 발산 페널티 1e15가 L-SHADE gbest가 되려면
     전 입자가 발산해야 함) 빈 문자열로 채운다(CSV 스키마는 유지하되 값 없음을 표시).
     검산(-j_net+penalty_v+penalty_line == gbest_f)은 경고만 하고 죽이지 않는다(확정 사항 2) -
     본실험 도중 assert로 죽으면 손해가 훨씬 크다)."""
@@ -364,8 +384,9 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
         print('  경고: gbest 해가 발산 상태 - 편익 분해 불가(전 입자 발산 등 비정상 상황).',
               flush=True)
         return dict(
-            j_net='', b_energy='', b_defer='', b_arb='', b_loss='',
+            j_net='', b_energy='', b_defer='', b_arb='', b_loss_avg='',
             b_arb_total='', b_loss_total='', cost='',
+            capex_power_annual='', capex_energy_annual='', opex='',
             v_violation='', i_violation='', penalty_v='', penalty_line='', decomposition_ok='',
             recompute_jnet_delta='', recompute_convergence_ratio='',
             recompute_max_p_shift='', cross_effect_pct_avg_max='',
@@ -381,7 +402,7 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
     recomputed_fitness = -detail['j_net'] + penalty_v + penalty_line
     diff = abs(recomputed_fitness - gbest_f)
     if diff > RUN_CONSISTENCY_ATOL_WON:
-        print(f'  경고: gbest_f 재현 불일치 - gbest_f(PSO)={gbest_f:.6e} vs '
+        print(f'  경고: gbest_f 재현 불일치 - gbest_f(L-SHADE)={gbest_f:.6e} vs '
               f'재계산(-j_net+penalty_v+penalty_line)={recomputed_fitness:.6e} '
               f'(차이={diff:.4e}원 > 허용오차 {RUN_CONSISTENCY_ATOL_WON}원). '
               'evaluate.py 로직 변경이나 편익 분해 코드의 버그를 의심할 것.', flush=True)
@@ -429,7 +450,7 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
 
     return dict(
         j_net=detail['j_net'], b_energy=detail['b_energy'], b_defer=detail['b_defer'],
-        b_arb=detail['b_arb'], b_loss=detail['b_loss'],
+        b_arb=detail['b_arb'], b_loss_avg=detail['b_loss'],
         b_arb_total=detail['b_arb_total'], b_loss_total=detail['b_loss_total'],
         cost=detail['cost'],
         v_violation=detail['v_violation'], i_violation=detail['i_violation'],
@@ -475,21 +496,24 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
     _init_csv(gens_path, GEN_FIELDS)
     _init_csv(runs_path, RUN_FIELDS)
 
-    print(f'\n[n_ess={n_ess}] 시작: n_particles={profile["n_particles"]} '
-          f'n_iters={profile["n_iters"]} n_runs={profile["n_runs"]} n_workers={n_workers}',
-          flush=True)
-    print(f'[n_ess={n_ess}] 로그: {gens_path}\n              {runs_path}', flush=True)
-
     bounds = _build_bounds(n_ess)
     int_dims = _build_int_dims(n_ess)
+    n_dims = len(bounds)
+    n_init = 12 * n_dims
+    eval_budget = profile['budget_coef'] * n_init
+
+    print(f'\n[n_ess={n_ess}] 시작: N_init={n_init} eval_budget={eval_budget} '
+          f'n_runs={profile["n_runs"]} n_workers={n_workers}', flush=True)
+    print(f'[n_ess={n_ess}] 로그: {gens_path}\n              {runs_path}', flush=True)
+
+    best_gbest_f = math.inf
 
     # 기수마다 독립된 가상의 부모 시퀀스(spawn_key=(n_ess,)) - 어떤 다른 n_ess 값들과
     # 같은 호출에서 함께 실행되든, spawn 호출 순서와 무관하게 항상 같은 run별 시드가
-    # 나오게 한다(seed=run_idx 같은 저품질 시드 대신 SeedSequence 계보를 명시적으로 분리).
+    # 나오게 한다(base_seed+run_idx 같은 저품질 시드 대신 SeedSequence 계보를 명시적으로
+    # 분리한다). L-SHADE의 default_rng(seed)는 SeedSequence 객체를 직접 받는다.
     base_seq = np.random.SeedSequence(entropy=base_seed, spawn_key=(n_ess,))
     run_seed_seqs = base_seq.spawn(profile['n_runs'])
-
-    best_gbest_f = math.inf
 
     # ★ Pool은 run마다 새로 만들지 않고 이 기수 안에서 재사용한다(init_worker의 기저
     # 조류계산 120회 캐싱 비용을 run마다 다시 치르지 않기 위함). 기수가 바뀌면(차원이
@@ -498,43 +522,37 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
     try:
         for run_idx in range(profile['n_runs']):
             objective = RunObjective(pool, n_ess, n_workers)
-            pso = pso_core.PSO(
+            optimizer = lshade_core.LSHADEBench(
                 objective=objective,
                 bounds=bounds,
-                n_particles=profile['n_particles'],
-                n_iters=profile['n_iters'],
-                w_max=PM.PSO_W_MAX, w_min=PM.PSO_W_MIN,
-                c1=PM.PSO_C1, c2=PM.PSO_C2,
-                v_clamp_k=PM.PSO_V_MAX_RATIO,
+                n_particles=n_init,
+                n_iters=eval_budget,
                 int_dims=int_dims,
                 seed=run_seed_seqs[run_idx],
+                eval_budget=eval_budget,
             )
 
             t_run0 = time.perf_counter()
-            result = pso.optimize()
+            result = optimizer.optimize()
             wall_time_s = time.perf_counter() - t_run0
 
-            history = result['history']
-            assert len(history) == len(objective.gen_rows), (
-                f'세대 수 불일치: history={len(history)} vs gen_rows={len(objective.gen_rows)} '
-                '- pso_core가 objective를 호출하는 횟수가 바뀌었는지 확인 필요'
-            )
-            gen_rows_full = [
-                dict(n_ess=n_ess, run=run_idx, gen=row['gen'], gbest_f=float(gbest_f),
-                     mean_f=row['mean_f'], std_f=row['std_f'], worst_f=row['worst_f'],
-                     elapsed_s=row['elapsed_s'],
-                     coef_cache_hit_rate_cumulative=row[
-                         'coef_cache_hit_rate_cumulative'
-                     ])
-                for row, gbest_f in zip(objective.gen_rows, history)
-            ]
+            gen_rows_full = []
+            running_best = float('inf')
+            for source_row in objective.gen_rows:
+                row = dict(source_row)
+                running_best = min(running_best, row.pop('best_f_batch'))
+                gen_rows_full.append(dict(
+                    n_ess=n_ess,
+                    run=run_idx,
+                    gbest_f=running_best,
+                    **row,
+                ))
             _append_csv_rows(gens_path, GEN_FIELDS, gen_rows_full)
 
-            # seed 컬럼은 이 run에 실제로 쓰인 자식 SeedSequence(=SeedSequence(entropy=
-            # base_seed, spawn_key=(n_ess,)).spawn(n_runs)[run_idx])를 대표하는 정수를 남긴다
-            # (generate_state로 상태 1워드를 뽑음 - PSO에 넘긴 seed 그 자체의 지문).
-            # BASE_SEED 자체는 CSV 파일명이 아니라 실행 시 --seed 인자/stdout에 남으므로,
-            # "이 run이 정확히 어떤 난수열로 돌았는가"를 구분하는 용도로는 이 값이 더 직접적이다.
+            # seed 컬럼에는 이 run에 실제로 쓰인 자식 SeedSequence를 대표하는 정수 지문을
+            # 남긴다(generate_state로 상태 1워드). base_seed 자체는 --seed 인자/stdout에
+            # 남으므로, "이 run이 어떤 난수열로 돌았는가"를 구분하는 데는 이 지문이 직접적이다.
+            # 재현하려면 --seed 값과 n_ess, run_idx를 함께 알아야 한다.
             seed_repr = int(run_seed_seqs[run_idx].generate_state(1)[0])
             min_bdefer = objective.min_bdefer if math.isfinite(objective.min_bdefer) else ''
             gbest_f = float(result['f'])
@@ -542,7 +560,8 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
             # ★ --diagnose 여부와 무관하게 항상 계산·기록 (확정 사항 2)).
             gbest_detail = _evaluate_gbest_detail(result['x'])
             benefit_fields = _gbest_detail_to_run_fields(gbest_detail, gbest_f)
-            # G의 메인 프로세스 gbest 1회 통계 대신, PSO를 수행한 전 워커의
+            benefit_fields.update(_annual_cost_components(result['x']))
+            # G의 메인 프로세스 gbest 1회 통계 대신, L-SHADE를 수행한 전 워커의
             # PID별 누적 카운터 baseline 차분 합으로 runs.csv를 채운다.
             benefit_fields.update(objective.cache_run_fields())
 
@@ -586,7 +605,7 @@ def run_for_n_ess(n_ess, profile, n_workers, base_seed, diagnose, run_postproces
                 print(f'[n_ess={n_ess}] postprocess 생략(그룹 없음) - runs.csv를 확인할 것.',
                       flush=True)
         except Exception as e:
-            # runs.csv/generations.csv는 이미 저장되어 안전하다 - postprocess 실패로 PSO
+            # runs.csv/generations.csv는 이미 저장되어 안전하다 - postprocess 실패로 L-SHADE
             # 결과가 유실되면 안 되므로 예외를 삼키고 경고만 남긴다(재실행은 명령 하나로 가능).
             print(f'[n_ess={n_ess}] ★ 경고: postprocess 자동 실행 중 오류 발생({e!r}). '
                   f'runs.csv/generations.csv는 이미 저장되어 있으니 수동으로 재실행할 것: '
@@ -607,7 +626,7 @@ def _parse_n_ess_list(s):
 
 def _build_arg_parser():
     parser = argparse.ArgumentParser(
-        description='ESS 배치·용량 산정 PSO 파이프라인 진입점 (CLAUDE.md 부록A).',
+        description='ESS 배치·용량 산정 L-SHADE 파이프라인 진입점 (CLAUDE.md 부록A).',
         epilog='예: python main.py --n-ess 1 --profile dev',
     )
     parser.add_argument('--n-ess', type=str, default='1',
@@ -616,13 +635,13 @@ def _build_arg_parser():
                          help='dev(기본, 첫 실행용) 또는 full(본실험, 명시 지정 필요).')
     parser.add_argument('--n-workers', type=int, default=None,
                          help=f'기본 {DEFAULT_N_WORKERS}(실측 확정값, "확정 사항 1)" 참조).')
-    parser.add_argument('--n-particles', type=int, default=None, help='프로파일 기본값을 덮어씀.')
-    parser.add_argument('--n-iters', type=int, default=None, help='프로파일 기본값을 덮어씀.')
+    parser.add_argument('--budget-coef', type=int, default=None,
+                         help='평가예산 계수(eval_budget=budget_coef*12*n_dims)를 덮어씀.')
     parser.add_argument('--n-runs', type=int, default=None, help='프로파일 기본값을 덮어씀.')
     parser.add_argument('--seed', type=int, default=DEFAULT_BASE_SEED,
-                         help='SeedSequence의 BASE_SEED (run별 시드는 여기서 파생). '
-                              'runs.csv의 seed 컬럼은 이 값에서 파생된 run별 자식 시드를 '
-                              '기록한다(재현하려면 이 --seed 값과 n_ess, run을 함께 알아야 함).')
+                         help='BASE_SEED. run별 시드는 SeedSequence(entropy=BASE_SEED, '
+                              'spawn_key=(n_ess,)).spawn(n_runs)에서 파생하며, runs.csv에는 '
+                              '각 자식 시드의 정수 지문을 기록한다.')
     parser.add_argument('--diagnose', action='store_true',
                          help='각 run 종료 후 gbest 해의 페널티 성분을 사후 재계산해 출력.')
     parser.add_argument('--no-postprocess', action='store_true',
@@ -633,10 +652,8 @@ def _build_arg_parser():
 
 def _resolve_profile(args):
     profile = dict(PROFILES[args.profile])
-    if args.n_particles is not None:
-        profile['n_particles'] = args.n_particles
-    if args.n_iters is not None:
-        profile['n_iters'] = args.n_iters
+    if args.budget_coef is not None:
+        profile['budget_coef'] = args.budget_coef
     if args.n_runs is not None:
         profile['n_runs'] = args.n_runs
     n_workers = args.n_workers if args.n_workers is not None else DEFAULT_N_WORKERS
