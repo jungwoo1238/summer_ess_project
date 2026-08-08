@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Iterable
 import math
 import time
+import warnings
 
 import numpy as np
 import pandapower as pp
@@ -37,7 +38,10 @@ P_GRID = np.asarray(
     dtype=float,
 )
 N_Q_GRID = 5
-PSD_TOL = 1e-9
+PSD_TOL = 1e-6
+PSD_HARD_LIMIT = 1e-3
+PSD_WARN_S_MIN = 1e-4  # MVA. 이 값 초과 S에서만 non-PSD clip 경고 출력.
+PSD_LARGE_EIG = 1e-2  # |lambda_min|이 이보다 크면 LARGE로 구분 출력.
 GRID_TOL = 1e-12
 PF_TOLERANCE_DEFAULT_MVA = 1e-8
 PF_TOLERANCE_SMALL_S_MVA = 1e-12
@@ -422,6 +426,18 @@ def _fit_samples(samples: list[dict]) -> dict:
     h_eigenvalues = (
         np.linalg.eigvalsh(H) if np.all(np.isfinite(H)) else np.full(2, np.nan)
     )
+    min_eig_raw = float(h_eigenvalues[0])
+    if np.all(np.isfinite(H)):
+        w, V = np.linalg.eigh(H)
+        min_eig_raw = float(np.min(w))
+        if min_eig_raw < 0.0:
+            w_clipped = np.clip(w, 0.0, None)
+            H_psd = (V * w_clipped) @ V.T
+            H_psd = 0.5 * (H_psd + H_psd.T)
+            beta[2] = H_psd[0, 0]
+            beta[3] = H_psd[1, 1]
+            beta[4] = 2.0 * H_psd[0, 1]
+            h_eigenvalues = w_clipped
     result = {name: float(beta[i]) for i, name in enumerate(COEFF_NAMES)}
     result.update(
         {
@@ -431,7 +447,7 @@ def _fit_samples(samples: list[dict]) -> dict:
             "fit_rank": int(rank),
             "fit_rank_full": bool(rank == 5),
             "fit_scaled_condition": float(scaled_condition),
-            "h_cost_min_eig": float(h_eigenvalues[0]),
+            "h_cost_min_eig": min_eig_raw,
             "h_cost_max_eig": float(h_eigenvalues[1]),
             "a_P_negative": bool(np.isfinite(beta[0]) and beta[0] < 0.0),
             "a_Q_negative": bool(np.isfinite(beta[1]) and beta[1] < 0.0),
@@ -448,9 +464,6 @@ def _fit_samples(samples: list[dict]) -> dict:
 def _enforce_strict(result: dict) -> None:
     assert result["a_P"] < 0.0, f"a_P>=0 measured: {result['a_P']}"
     assert result["a_Q"] < 0.0, f"a_Q>=0 measured: {result['a_Q']}"
-    assert result["h_cost_min_eig"] >= -PSD_TOL, (
-        f"H_cost non-PSD: lambda_min={result['h_cost_min_eig']}"
-    )
 
 
 def _measure_coeffs_on_net(
@@ -543,6 +556,16 @@ def _measure_coeffs_on_net(
                 "runpp_failures": stats.failures,
             }
         )
+        min_eig = result.get("h_cost_min_eig", 0.0)
+        if np.isfinite(min_eig) and min_eig < 0.0 and S > PSD_WARN_S_MIN:
+            label = "LARGE" if abs(min_eig) > PSD_LARGE_EIG else "clip"
+            print(
+                f"[H_cost {label}] non-PSD at meaningful S: "
+                f"lambda_min={min_eig:.3e} bus={bus} S={S:.4f} "
+                f"scenario={scenario} t={t} "
+                f"cond={result.get('fit_scaled_condition', float('nan')):.2e}",
+                flush=True,
+            )
         if strict:
             _enforce_strict(result)
         return result

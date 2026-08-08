@@ -105,8 +105,8 @@ NUMERIC_RUN_FIELDS = [
 OPTIONAL_NUMERIC_RUN_FIELDS = [
     'cross_effect_pct_avg_max', 'cross_effect_pct_peak_max',
     'cross_effect_mw_avg_total', 'cross_effect_mw_peak_total',
-    'cross_effect_won_avg_annual',
     'capex_power_annual', 'capex_energy_annual', 'opex',
+    'peak_reduction_mw',
 ]
 
 
@@ -147,6 +147,7 @@ def load_runs_csv(path):
         rec['run'] = int(float(row['run']))
         rec['seed'] = row.get('seed', '')
         rec['x_json'] = row.get('x_json', '')
+        rec['peak_day_selected'] = row.get('peak_day_selected', '')
         rec['x'] = np.array(json.loads(rec['x_json']), dtype=float) if rec['x_json'] else np.array([])
         rec['decomposition_ok'] = _to_bool(row.get('decomposition_ok', ''))
         parsed.append(rec)
@@ -582,6 +583,7 @@ def section3_4_efc(group, all_units, installed_units, schedules, peak_day):
             results.append(dict(unit_idx=full_idx, b=b, E=E, active=False,
                                  annual_efc=float('nan'), worst_case_annual_efc=float('nan'),
                                  peak_efc={s: float('nan') for s in PM.PEAK_DAYS},
+                                 daily_efc={s: float('nan') for s in PM.ALL_DAYS},
                                  peak_day=peak_day, adjusted_season=adjusted_season))
             continue
 
@@ -589,10 +591,12 @@ def section3_4_efc(group, all_units, installed_units, schedules, peak_day):
         inst_idx += 1
         # 회계(_accounting_values)와 정합: select_peak_day가 고른 peak 하나만 반영한다.
         # 선택 계절 평일 1일을 peak일로 대체하고, 선택되지 않은 peak은 연간합에서 버린다.
+        daily_efc = {}
         annual_efc = 0.0
         for s in PM.AVG_DAYS:
             P_net, _soc, _q = schedules[s][i]
             avg_efc = _efc(P_net, E)
+            daily_efc[s] = avg_efc
             weight = PM.N_WEEKDAYS[s] - (
                 1.0 if s == adjusted_season else 0.0
             )
@@ -600,10 +604,17 @@ def section3_4_efc(group, all_units, installed_units, schedules, peak_day):
         peak_P_net = schedules[peak_day][i][0]
         annual_efc += _efc(peak_P_net, E)
         peak_efc = {s: _efc(schedules[s][i][0], E) for s in PM.PEAK_DAYS}
+        # 회계에서 선택된 peak 대표일만 연간 구성에 포함된다. 선택되지 않은 peak의
+        # 하루 EFC는 참고 출력(peak_efc)에는 남기되 units CSV 지표에서는 NaN으로 구분한다.
+        daily_efc.update({
+            s: peak_efc[s] if s == peak_day else float('nan')
+            for s in PM.PEAK_DAYS
+        })
         # peak 대체는 총 평일수 247일을 바꾸지 않으므로 기존 365/247 상한 스케일을 유지한다.
         worst_case_annual = annual_efc * (365.0 / PM.TOTAL_WEEKDAYS_PER_YEAR)
         results.append(dict(unit_idx=full_idx, b=b, E=E, active=True, annual_efc=annual_efc,
                              worst_case_annual_efc=worst_case_annual, peak_efc=peak_efc,
+                             daily_efc=daily_efc,
                              peak_day=peak_day, adjusted_season=adjusted_season))
 
     for r in results:
@@ -782,14 +793,13 @@ def _active_units_for_qp(units):
 
 
 def section3_7_cross_effect(group):
-    """n>=2의 QP 대각근사 오차와 편익환산 상한을 출력한다."""
+    """n>=2의 QP 대각근사 오차 진단값을 출력한다."""
     section(f"(3)-7 다기 대각근사 오차 - n_ess={group['n_ess']}")
     runs = group['runs']
     avg_pct = _stats([r['cross_effect_pct_avg_max'] for r in runs])
     peak_pct = _stats([r['cross_effect_pct_peak_max'] for r in runs])
     avg_mwh = _stats([r['cross_effect_mw_avg_total'] for r in runs])
     peak_mwh = _stats([r['cross_effect_mw_peak_total'] for r in runs])
-    annual_won = _stats([r['cross_effect_won_avg_annual'] for r in runs])
     if avg_pct['n'] == 0 and peak_pct['n'] == 0:
         print('  qp_diag_loss_vs_ac 신규 컬럼이 없어 생략(구 runs.csv 스키마).', flush=True)
         return None
@@ -799,16 +809,12 @@ def section3_7_cross_effect(group):
     # main.py 컬럼명에는 호환상 mw가 남지만 실제 값은 시간 적분된 MWh다.
     _print_stats('AVG cross total', avg_mwh, ' MWh')
     _print_stats('PEAK cross total', peak_mwh, ' MWh')
-    _print_stats('AVG annual impact', annual_won, ' 원/년')
     print('  참조선: n=1에서는 교차항이 0이므로 이 값은 단일기 손실모형 오차만 담는다. '
           'n>=2에서 n=1 대비 증가한 크기가 기 간 교차항이 QP 스케줄 선택에 준 영향의 '
           '참조값이다(수치만 제시, 자동 판정 없음).', flush=True)
-    print('  AVG annual impact는 시각별 (AC-QP) 손실MW × SMP(원/MWh) × DT × '
-          'N_WEEKDAYS의 정확 합이며, 교차항+근사오차가 연간 편익에 줄 수 있는 영향 상한이다.',
-          flush=True)
     return dict(
         avg_pct=avg_pct, peak_pct=peak_pct, avg_mwh=avg_mwh,
-        peak_mwh=peak_mwh, annual_won=annual_won,
+        peak_mwh=peak_mwh,
     )
 
 
@@ -1346,8 +1352,6 @@ def print_wide_schedule(installed_units, schedules):
 
 
 GROUP_C_MISSING_REASONS = {
-    'qp_loss_model_err_max': 'LP 목적함수의 시각별 예측 손실값이 저장되지 않음',
-    'qp_loss_model_err_mean': 'LP 목적함수의 시각별 예측 손실값이 저장되지 않음',
     'recompute_jnet_delta': '재산출 전 X0와 재산출 후 X1의 j_net이 저장되지 않음',
     'recompute_convergence_ratio': 'X0/X1/X2 회차별 j_net이 저장되지 않음',
     'recompute_max_p_shift': 'X0/X1 시나리오별 스케줄 차이가 저장되지 않음',
@@ -1377,8 +1381,10 @@ def _diagnostic_metrics(
     detail,
     best,
 ):
-    """8절 그룹 A/B 지표를 최적해 재현 자료에서 집계하고 그룹 C는 NaN으로 남긴다."""
+    """8절 그룹 A/B 및 저장된 그룹 C 지표를 최적해 재현 자료에서 집계한다."""
     metrics = {name: float('nan') for name in GROUP_C_MISSING_REASONS}
+    metrics.setdefault('qp_loss_model_err_max', float('nan'))
+    metrics.setdefault('qp_loss_model_err_mean', float('nan'))
     for name in (
         'recompute_jnet_delta',
         'recompute_convergence_ratio',
@@ -1458,6 +1464,22 @@ def _diagnostic_metrics(
             - float(np.max(slack_ess[peak_day]))
         )
     )
+    stored_peak_day = best.get('peak_day_selected', '')
+    stored_peak_reduction = best.get('peak_reduction_mw')
+    if stored_peak_day and stored_peak_day != peak_day:
+        print(f'  경고: runs.csv peak_day_selected={stored_peak_day} vs '
+              f'후처리 재평가 peak_day={peak_day}', flush=True)
+    if stored_peak_reduction is not None:
+        stored_defer = float(stored_peak_reduction) * PM.C_CAP_PER_MW_YR
+        if not np.isclose(
+            stored_defer,
+            metrics['peak_day_defer_benefit'],
+            rtol=1e-9,
+            atol=1e-6,
+        ):
+            print(f'  경고: peak_reduction_mw*C_CAP={stored_defer:.12g} vs '
+                  f'peak_day_defer_benefit={metrics["peak_day_defer_benefit"]:.12g}',
+                  flush=True)
 
     v_lindistflow_sq = detail.get('v_lindistflow_sq')
     v_ac = detail.get('v_ac')
@@ -1476,6 +1498,25 @@ def _diagnostic_metrics(
             )
         metrics['max_lindistflow_ac_voltage_err'] = max(voltage_errors)
         metrics['mu_penalty_active'] = mu_active
+
+    qp_diag = detail.get('qp_diag_loss_vs_ac')
+    if qp_diag is not None and evaluate._BASE_FLOW is not None:
+        errs = []
+        for scenario in PM.ALL_DAYS:
+            d = qp_diag[scenario]
+            qp = np.asarray(d['qp_diag_loss_mw'], dtype=float)
+            ac = np.asarray(d['ac_actual_loss_mw'], dtype=float)
+            base = np.asarray(
+                evaluate._BASE_FLOW['loss'][scenario], dtype=float
+            )
+            denom = np.abs(ac)
+            keep = denom >= (0.001 * np.abs(base))
+            if np.any(keep):
+                errs.append(np.abs(qp[keep] - ac[keep]) / denom[keep])
+        if errs:
+            all_err = np.concatenate(errs)
+            metrics['qp_loss_model_err_max'] = float(np.max(all_err))
+            metrics['qp_loss_model_err_mean'] = float(np.mean(all_err))
 
     if slack_ess_qzero is not None:
         q_daily = {
@@ -1834,6 +1875,7 @@ RUN_SUMMARY_FIELDS = [
     'total_negative_bdefer', 'min_bdefer_overall',
     # 8절 6차 신규 지표. 기존 필드의 순서·이름은 유지하고 끝에만 추가한다.
     *DIAGNOSTIC_SUMMARY_FIELDS,
+    'peak_day_selected', 'peak_reduction_mw',
 ]
 
 
@@ -1848,6 +1890,7 @@ def build_run_summary_row(result):
     neg_bdefer = result['neg_bdefer'] or {}
     bus_dist = result['bus_dist'] or {}
     bstar = bus_dist.get('bstar') or {}
+    best = result['best'] or {}
 
     def gross_stat(key, gross_list, field):
         if not gross_list:
@@ -1888,9 +1931,9 @@ def build_run_summary_row(result):
         cost_to_gross_ratio_pct_all_mean=gross_stat('cost_pct', ga, 'mean') if decomp else '',
         decomposition_violations=len(decomp['decomposition_bad']) if decomp else '',
         cost_check_ok=cost_check['ok'] if cost_check else '',
-        best_run=result['best']['run'] if result['best'] else '',
-        best_gbest_f=result['best']['gbest_f'] if result['best'] else '',
-        best_j_net=result['best']['j_net'] if result['best'] else '',
+        best_run=best.get('run', ''),
+        best_gbest_f=best.get('gbest_f', ''),
+        best_j_net=best.get('j_net', ''),
         s_boundary_frac=boundary.get('s_boundary_frac', ''),
         e_boundary_frac=boundary.get('e_boundary_frac', ''),
         boundary_warning=boundary.get('warning_str', ''),
@@ -1912,6 +1955,8 @@ def build_run_summary_row(result):
             field: diagnostic.get(field, '')
             for field in DIAGNOSTIC_SUMMARY_FIELDS
         },
+        peak_day_selected=best.get('peak_day_selected', ''),
+        peak_reduction_mw=best.get('peak_reduction_mw', ''),
     )
 
 
@@ -1924,6 +1969,8 @@ UNITS_FIELDS = [
     # 남긴다(다봉에서 파생 단일통계가 오도했다). SMP 대조는 schedule CSV로 직접 할 것.
     'dis_peak_hours_summer_avg', 'dis_peak_hours_summer_peak',
     'dis_peak_hours_winter_avg', 'dis_peak_hours_winter_peak',
+    # 대표일 하루 EFC = sum(|P_net|)*DT/(2*E*DoD). annual_efc와 별개다.
+    *[f'daily_efc_{scenario}' for scenario in PM.ALL_DAYS],
 ]
 
 
@@ -1982,6 +2029,9 @@ def build_units_rows(result):
             eta_peak=op['eta_peak'], duration_h=op['duration_h'], e_over_s=op['e_over_s'],
             annual_efc=efc_row.get('annual_efc', float('nan')),
         )
+        daily = efc_row.get('daily_efc', {})
+        for scenario in PM.ALL_DAYS:
+            row[f'daily_efc_{scenario}'] = daily.get(scenario, float('nan'))
         for k in UNITS_FIELDS:
             if k not in row:
                 row[k] = sim_row.get(k, float('nan'))

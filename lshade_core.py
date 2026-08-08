@@ -69,7 +69,7 @@ class _OptimizerBase:
 class LSHADEBench(_OptimizerBase):
     P_BEST_RATE = 0.11
     MEMORY_SIZE = 6
-    MIN_POPULATION = 4
+    MIN_POPULATION = 12
 
     def _sample_f(self, location):
         while True:

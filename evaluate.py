@@ -189,8 +189,8 @@ def _ensure_sgens(net, n):
 
 _LOSS_COEFF_NAMES = ("a_P", "a_Q", "b_PP", "b_QQ", "b_PQ")
 _COEF_REL_EPS = 1e-12
-S_ACTIVE_MIN = 1e-6  # MVA (1 kVA); 이보다 작으면 조류·편익 관점에서 비활성
-E_ACTIVE_MIN = 1e-6  # MWh (1 Wh); S 또는 E 하나라도 미만이면 비활성
+S_ACTIVE_MIN = 1e-3  # MVA (1 kVA); 이보다 작으면 조류·편익 관점에서 비활성. 2026-08 상향(구 1e-6): 극소 S 활성 기가 solve_peak QP를 ill-conditioned하게 만들어 CLARABEL 붕괴(n=2 run6 크래시)를 유발. 완주한 run5 소용량 기(S=4.3e-3)는 이 임계 위라 보존됨.
+E_ACTIVE_MIN = 1e-3  # MWh; 이보다 작으면 비활성. S와 대칭 상향(구 1e-6). S≥1e-3인데 E가 극소면 물리적으로 무의미(지속시간 극소)하므로 함께 올린다.
 
 
 def _assemble_coeffs_1unit(grid_result, scenario):

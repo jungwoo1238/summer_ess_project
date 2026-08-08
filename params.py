@@ -73,8 +73,8 @@ VALIDATION_CURRENT_LOAD_SLACK_1P0 = {
 # 2. 상위 PSO 탐색 경계 (CLAUDE.md 2절)
 # ============================================================
 B_BOUNDS = (1, 32)          # 정수, 슬랙(bus 0) 제외, 연속값 반올림
-S_BOUNDS = (0.0, 2.4)       # MVA (충전여유 2,473kW -> 2.4, DoD 무관)
-E_BOUNDS = (0.0, 10.2)      # MWh (x_max=4.234*S 살짝 상회, 조달비 포함 재산정)
+S_BOUNDS = (0.0, 2.9)       # MVA (충전여유 2,473kW -> 2.4, DoD 무관)
+E_BOUNDS = (0.0, 13.0)      # MWh (x_max=4.234*S 살짝 상회, 조달비 포함 재산정)
 # ★ Q_RATIO_BOUNDS 제거 (C.6-3 LinDistFlow 편입, 2026-07). Q는 이제 하위 LP의 시변 변수라
 # 상위(PSO) 경계가 필요 없다 - CLAUDE.md 부록C.4-(3).
 
@@ -242,8 +242,8 @@ PSO_MAIN = dict(n_particles=30, n_iters=60, n_runs=20)   # 본실험: 시나리�
 
 # 페널티 (뼈대: 정적 L1). 초기값 1e10 (J_net 스케일 ~1e8원/년을 확실히 압도) -> 첫 실행 위반 스케일 관찰 후 조정.
 # (CLAUDE.md 7절: "충분히 큰 고정상수로 시작 -> 위반 스케일 관찰 후 조정")
-LAMBDA_V = 1e10       # TODO: 뼈대 실행 후 위반 스케일 관찰해 재조정
-LAMBDA_LINE = 1e10    # TODO: 뼈대 실행 후 위반 스케일 관찰해 재조정
+LAMBDA_V = 1e09       # TODO: 뼈대 실행 후 위반 스케일 관찰해 재조정
+LAMBDA_LINE = 1e09    # TODO: 뼈대 실행 후 위반 스케일 관찰해 재조정
 
 # 하위 LP 전압 유도항 가중치 (부록C.4-(1), C.6-3). LAMBDA_V(원/pu, 연간 ALL_DAYS x 24h x
 # 전버스 합산 스케일)와 MU_VOLT(원/pu, 일간 단일 시나리오 스케일)는 단위가 다르다 - 출발점은

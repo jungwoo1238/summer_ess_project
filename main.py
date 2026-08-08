@@ -56,13 +56,13 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
 
 DEFAULT_BASE_SEED = 42
-DEFAULT_N_WORKERS = 16   # scripts/bench_workers.py 실측 확정값 (아래 "확정 사항 1)" 참조)
+DEFAULT_N_WORKERS = 8   # scripts/bench_workers.py 실측 확정값 (아래 "확정 사항 1)" 참조)
 
 # L-SHADE 초기 개체군은 12*n_dims로 결정한다. 프로파일은 평가예산 계수와 run 수만 정의한다.
 # eval_budget = budget_coef * N_init (N_init=12*n_dims): dev 30배, full 100배.
 PROFILES = {
-    'dev':  dict(budget_coef=30,  n_runs=3),
-    'full': dict(budget_coef=100, n_runs=20),
+    'dev':  dict(budget_coef=50,  n_runs=3),
+    'full': dict(budget_coef=50, n_runs=20),
 }
 
 GEN_FIELDS = [
@@ -82,9 +82,9 @@ RUN_FIELDS = [
     'cross_effect_pct_avg_max', 'cross_effect_pct_peak_max',
     # 컬럼명은 명령안 호환을 위해 mw를 유지하지만 evaluate의 cross_effect 단위는 MWh다.
     'cross_effect_mw_avg_total', 'cross_effect_mw_peak_total',
-    'cross_effect_won_avg_annual',
     'coef_cache_hit_rate', 'coef_runpp_total', 'coef_unique_bs_count',
     'coef_measure_wall_s',
+    'peak_day_selected', 'peak_reduction_mw',
 ]
 
 # gbest_f(L-SHADE가 이미 추적 중인 값) vs -j_net+penalty_v+penalty_line(gbest 해를 사후
@@ -391,9 +391,10 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
             recompute_jnet_delta='', recompute_convergence_ratio='',
             recompute_max_p_shift='', cross_effect_pct_avg_max='',
             cross_effect_pct_peak_max='', cross_effect_mw_avg_total='',
-            cross_effect_mw_peak_total='', cross_effect_won_avg_annual='',
+            cross_effect_mw_peak_total='',
             coef_cache_hit_rate='',
             coef_runpp_total='', coef_unique_bs_count='', coef_measure_wall_s='',
+            peak_day_selected='', peak_reduction_mw='',
         )
 
     penalty_v = PM.LAMBDA_V * detail['v_violation']
@@ -413,7 +414,6 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
         cross_fields = dict(
             cross_effect_pct_avg_max='', cross_effect_pct_peak_max='',
             cross_effect_mw_avg_total='', cross_effect_mw_peak_total='',
-            cross_effect_won_avg_annual='',
         )
     else:
         cross_fields = dict(
@@ -432,21 +432,12 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
             cross_effect_mw_peak_total=sum(
                 float(qp_diag[s]['cross_effect']) for s in PM.PEAK_DAYS
             ),
-            cross_effect_won_avg_annual=sum(
-                float(
-                    np.sum(
-                        (
-                            np.asarray(qp_diag[s]['ac_actual_loss_mw'], dtype=float)
-                            - np.asarray(qp_diag[s]['qp_diag_loss_mw'], dtype=float)
-                        )
-                        * np.asarray(PM.SMP_PER_MWH[s], dtype=float)
-                    )
-                    * PM.DT_HOURS
-                    * PM.N_WEEKDAYS[s]
-                )
-                for s in PM.AVG_DAYS
-            ),
         )
+
+    peak_day = detail['peak_day']
+    slack_base = evaluate._BASE_FLOW['p_slack'][peak_day]
+    slack_ess = detail['p_slack_ess'][peak_day]
+    peak_reduction_mw = float(np.max(slack_base) - np.max(slack_ess))
 
     return dict(
         j_net=detail['j_net'], b_energy=detail['b_energy'], b_defer=detail['b_defer'],
@@ -466,6 +457,8 @@ def _gbest_detail_to_run_fields(detail, gbest_f):
         coef_runpp_total=detail.get('coef_runpp_total', float('nan')),
         coef_unique_bs_count=detail.get('coef_unique_bs_count', float('nan')),
         coef_measure_wall_s=detail.get('coef_measure_wall_s', float('nan')),
+        peak_day_selected=peak_day,
+        peak_reduction_mw=peak_reduction_mw,
     )
 
 
